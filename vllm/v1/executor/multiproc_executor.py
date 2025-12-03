@@ -36,6 +36,8 @@ from vllm.distributed.parallel_state import (
     get_ep_group,
     get_inner_dp_world_group,
     get_pcp_group,
+    get_rp_group,
+    get_up_group,
     get_pp_group,
     get_tp_group,
 )
@@ -840,6 +842,10 @@ class WorkerProc:
         dp_rank = get_dp_group().rank_in_group
         pp_size = get_pp_group().world_size
         pp_rank = get_pp_group().rank_in_group
+        rp_size = get_rp_group().world_size
+        rp_rank = get_rp_group().rank_in_group
+        up_size = get_up_group().world_size
+        up_rank = get_up_group().rank_in_group
         pcp_size = get_pcp_group().world_size
         pcp_rank = get_pcp_group().rank_in_group
         tp_size = get_tp_group().world_size
@@ -851,6 +857,10 @@ class WorkerProc:
             process_name += f"_DP{dp_rank}"
         if pp_size > 1:
             process_name += f"_PP{pp_rank}"
+        if rp_size > 1:
+            process_name += f"_RP{rp_rank}"
+        if up_size > 1:
+            process_name += f"_UP{up_rank}"
         if pcp_size > 1:
             process_name += f"_PCP{pcp_rank}"
         if tp_size > 1:

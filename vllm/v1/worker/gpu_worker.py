@@ -915,6 +915,9 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
+        parallel_config.ring_parallel_size,
+        parallel_config.ulysses_parallel_size,
+        parallel_config.share_rp_tp_group,
     )
 
     # Init ec connector here before KV caches caches init
