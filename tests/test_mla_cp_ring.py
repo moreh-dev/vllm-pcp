@@ -60,6 +60,7 @@ def get_vllm_config():
 
     return vllm_config, hf_config, cache_config
 
+
 def run_test(rank, world_size):
     # Setup distributed
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -74,6 +75,23 @@ def run_test(rank, world_size):
         backend = "gloo"
         
     dist.init_process_group(backend, rank=rank, world_size=world_size)
+    
+    # Init vLLM distributed state
+    from vllm.distributed import parallel_state
+    # Initialize the "World" state wrapper
+    # Note: init_distributed_environment checks if dist is initialized and uses it.
+    parallel_state.init_distributed_environment() 
+    
+    # Initialize Model Parallelism
+    # We use TP=1 because we want each rank to have a full set of heads (standard CP logic often interacts with TP, 
+    # but for this specific Ring Attention test, we are manually handling the ring communication and 
+    # want the layer to think it's standalone or full-heads).
+    # We set ring_model_parallel_size=world_size to match the manual ring setup, although we manually manage groups too.
+    parallel_state.ensure_model_parallel_initialized(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        ring_model_parallel_size=world_size  # Optional: mirrors the user's note about RP group
+    )
     
     # Create Process Groups
     # Ring PG covers everyone
@@ -326,7 +344,9 @@ def run_test(rank, world_size):
         print("TEST PASSED: Vanilla MLA matches Manual CP Ring MLA.")
 
     dist.barrier()
-    dist.destroy_process_group()
+    parallel_state.destroy_model_parallel()
+    parallel_state.destroy_distributed_environment()
+
 
 if __name__ == "__main__":
     world_size = 2
