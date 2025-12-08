@@ -58,6 +58,12 @@ def get_vllm_config():
     vllm_config.cache_config = cache_config
     vllm_config.scheduler_config = scheduler_config
     vllm_config.quant_config = None
+    # Use a real CompilationConfig or fully mocked one with required attributes
+    # CustomOp checks custom_ops list count of "all"/"none"
+    # It also checks mode
+    from vllm.config.compilation import CompilationConfig
+    vllm_config.compilation_config = CompilationConfig()
+    vllm_config.compilation_config.custom_ops = ["all"]
     vllm_config.compilation_config.static_forward_context = {}
 
     return vllm_config, hf_config, cache_config
