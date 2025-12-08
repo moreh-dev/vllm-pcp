@@ -52,6 +52,7 @@ def get_vllm_config():
 
     scheduler_config = MagicMock(spec=SchedulerConfig)
     scheduler_config.max_num_batched_tokens = 4096
+    scheduler_config.max_num_seqs = 256
     
     vllm_config = MagicMock(spec=VllmConfig)
     vllm_config.model_config = model_config
