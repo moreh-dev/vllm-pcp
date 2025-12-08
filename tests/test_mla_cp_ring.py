@@ -99,7 +99,8 @@ def run_test(rank, world_size):
     parallel_state.ensure_model_parallel_initialized(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        ring_model_parallel_size=world_size  # Optional: mirrors the user's note about RP group
+        #ring_model_parallel_size=world_size,  # Optional: mirrors the user's note about RP group
+        ring_model_parallel_size=1
     )
     
     # Create Process Groups
