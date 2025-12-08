@@ -40,6 +40,8 @@ def get_vllm_config():
         model_type="deepseek_v2",
         vocab_size=1000,
     )
+    # Mock rope_parameters as expected by vLLM DeepseekV2 model
+    hf_config.rope_parameters = {"rope_type": "default", "rope_theta": 10000, "factor": 1.0}
     model_config.hf_config = hf_config
 
     cache_config = MagicMock(spec=CacheConfig)
@@ -123,225 +125,229 @@ def run_test(rank, world_size):
     
     vllm_config, hf_config, cache_config = get_vllm_config()
     
-    # Initialize Layer
-    layer = DeepseekV2MLAAttention(
-        vllm_config=vllm_config,
-        config=hf_config,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=kv_lora_rank,
-        max_position_embeddings=4096,
-        cache_config=cache_config,
-    ).to(device).to(torch.bfloat16)
-    
-    # Create Inputs
-    batch_size = 1
-    seq_len = 128
-    total_seq_len = seq_len * world_size
-    
-    # We want to test that if we have a full sequence, processed by ring attention (chunked),
-    # matches the full sequence processed by vanilla attention.
-    
-    # Input for Vanilla (Whole Global Sequence)
-    # We need to construct a global input and then slice it for the local rank to simulate "Ring" input.
-    # BUT, to verify correctness, it's easier to verify:
-    # Vanilla(Global_Input) == Gather(Ring_Forward(Local_Input))
-    
-    torch.manual_seed(42)
-    # Global hidden states
-    global_hidden_states = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
-    positions = torch.arange(total_seq_len, device=device).unsqueeze(0)
-    
-    # --- 1. Vanilla Forward ---
-    # We run this only on rank 0 roughly, or everyone runs it on global data.
-    # Ideally everyone runs it to verify.
-    with torch.no_grad():
-        vanilla_output = layer(positions, global_hidden_states)
-    
-    # --- 2. Ring Attention Forward ---
-    # Prepare Local Input
-    start_idx = rank * seq_len
-    end_idx = (rank + 1) * seq_len
-    local_hidden_states = global_hidden_states[:, start_idx:end_idx, :].clone()
-    local_positions = positions[:, start_idx:end_idx].clone()
-    
-    # We need to manually perform the projections + RoPE because DeepseekV2MLAAttention
-    # wraps everything inside. We want to test "MLA Projections -> Ring Attention -> Output Projection"
-    
-    # Step A: Projections (mimic layer.forward_native up to attention call)
-    # layer has: fused_qkv_a_proj, q_b_proj, kv_b_proj, etc.
-    
-    with torch.no_grad():
-        # MLA Logic extracted from forward_native
-        # 1. Down Projection (Wa)
-        qkv_lora = layer.fused_qkv_a_proj(local_hidden_states)[0]
-        q_c, kv_lora = qkv_lora.split(
-            [layer.q_lora_rank, layer.kv_lora_rank + layer.qk_rope_head_dim],
-            dim=-1
-        )
+    # Import config setter
+    from vllm.config.vllm import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        # Initialize Layer
+        layer = DeepseekV2MLAAttention(
+            vllm_config=vllm_config,
+            config=hf_config,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            max_position_embeddings=4096,
+            cache_config=cache_config,
+        ).to(device).to(torch.bfloat16)
         
-        # 2. Q Up Projection (Wb)
-        q_c = layer.q_a_layernorm(q_c)
-        q = layer.q_b_proj(q_c)[0]
-        q = q.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
+        # Create Inputs
+        batch_size = 1
+        seq_len = 128
+        total_seq_len = seq_len * world_size
         
-        # 3. KV Split & Norm
-        kv_c, k_pe = kv_lora.split([layer.kv_lora_rank, layer.qk_rope_head_dim], dim=-1)
-        kv_c_normed = layer.kv_a_layernorm(kv_c)
+        # We want to test that if we have a full sequence, processed by ring attention (chunked),
+        # matches the full sequence processed by vanilla attention.
         
-        # 4. KV Up Projection (Wb) for Key Generation (for ring attn we need full keys/values)
-        # Wait, MLA usually keeps KV compressed. 
-        # But ring_attention.py expects: query, key, value tensors.
-        # "Vanilla MLA" = MLAAttention(use_sparse=False) -> uses cuda_impl/triton_impl
-        # If we use ring_attention, we need materialized K and V?
-        # Yes, ring_attention.py does standard attention. 
-        # MLA can be viewed as standard attention if we project K and V fully.
-        # K = [kv_c_normed @ W_Uk, k_pe]
-        # V = [kv_c_normed @ W_Uv]
+        # Input for Vanilla (Whole Global Sequence)
+        # We need to construct a global input and then slice it for the local rank to simulate "Ring" input.
+        # BUT, to verify correctness, it's easier to verify:
+        # Vanilla(Global_Input) == Gather(Ring_Forward(Local_Input))
         
-        # layer.kv_b_proj projects to (qk_nope_head_dim + v_head_dim)
-        # It takes kv_c_normed
-        kv_up = layer.kv_b_proj(kv_c_normed)[0]
-        kv_up = kv_up.view(batch_size, seq_len, layer.num_heads, layer.qk_nope_head_dim + layer.v_head_dim)
-        k_nope, v = kv_up.split([layer.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+        torch.manual_seed(42)
+        # Global hidden states
+        global_hidden_states = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+        positions = torch.arange(total_seq_len, device=device).unsqueeze(0)
         
-        # 5. RoPE
-        # k_pe needs to be expanded/repeated?
-        # In forward_native:
-        # k_pe = k_pe.unsqueeze(1) (batch, 1, seq, dim) ? No, typically (batch, seq, head, dim) or sim.
-        # In forward_native: k_pe = k_pe.unsqueeze(1) -> (B, 1, S, D) ?
-        # Let's check code:
-        # k_pe = k_pe.unsqueeze(1)
-        # rotary_emb(positions, q[..., nope:], k_pe)
-        # q shape is (B*S, H, D) flattened or (B, S, H, D) depending on impl.
-        # Here we reshaped to (B, S, H, D).
+        # --- 1. Vanilla Forward ---
+        # We run this only on rank 0 roughly, or everyone runs it on global data.
+        # Ideally everyone runs it to verify.
+        with torch.no_grad():
+            vanilla_output = layer(positions, global_hidden_states)
         
-        # Apply RoPE
-        q_nope = q[..., :layer.qk_nope_head_dim]
-        q_pe = q[..., layer.qk_nope_head_dim:]
+        # --- 2. Ring Attention Forward ---
+        # Prepare Local Input
+        start_idx = rank * seq_len
+        end_idx = (rank + 1) * seq_len
+        local_hidden_states = global_hidden_states[:, start_idx:end_idx, :].clone()
+        local_positions = positions[:, start_idx:end_idx].clone()
         
-        # k_pe comes from latent, shape (B, S, D_rope).
-        # We need to broadcast it to heads?
-        # In MLA, k_pe is shared across heads usually (Multi-Query for PE part).
-        # Wrapper says: k_pe = k_pe.unsqueeze(1) before rotary.
-        # `rotary_emb` handles the broadcasting if needed?
+        # We need to manually perform the projections + RoPE because DeepseekV2MLAAttention
+        # wraps everything inside. We want to test "MLA Projections -> Ring Attention -> Output Projection"
         
-        # vllm rotary: forward(positions, q, k)
-        # positions: (B, S)
-        # q: (B, S, H, D) or (B, H, S, D)?
-        # wrapper.forward_native:
-        # q = q.view(-1, self.num_heads, self.qk_head_dim) # (TotalTokens, H, D)
-        # positions flattened.
-        # We are using batch mode here for ring attention.
+        # Step A: Projections (mimic layer.forward_native up to attention call)
+        # layer has: fused_qkv_a_proj, q_b_proj, kv_b_proj, etc.
         
-        # Let's simulate flattening for RoPE to match vLLM utility if needed, or just map carefully.
-        # vLLM rope expects (num_tokens, num_heads, head_size).
-        
-        # Let's verify shapes.
-        # q: (1, 128, 16, 192) -> view -> (128, 16, 192)
-        q_flat = q.view(-1, layer.num_heads, layer.qk_head_dim)
-        
-        k_pe_flat = k_pe.reshape(-1, 1, layer.qk_rope_head_dim) # (128, 1, 64)
-        
-        q_nope_flat = q_flat[..., :layer.qk_nope_head_dim]
-        q_pe_flat = q_flat[..., layer.qk_nope_head_dim:]
-        
-        positions_flat = local_positions.view(-1)
-        
-        q_pe_rot, k_pe_rot = layer.rotary_emb(positions_flat, q_pe_flat, k_pe_flat)
-        
-        # Re-assemble Q
-        q_final = torch.cat([q_nope_flat, q_pe_rot], dim=-1) # (128, 16, 192)
-        
-        # Re-assemble K
-        # K consists of k_nope and k_pe_rot.
-        # k_nope comes from kv_up (B, S, H, D_nope). 
-        # k_pe_rot is (B*S, 1, D_rope). We need to broadcast k_pe to H heads?
-        # Yes, MLA uses shared PE.
-        # But for Ring Attention (standard MHA kernel), we need materialized K per head.
-        k_nope_flat = k_nope.view(-1, layer.num_heads, layer.qk_nope_head_dim)
-        k_pe_expanded = k_pe_rot.expand(-1, layer.num_heads, -1)
-        k_final = torch.cat([k_nope_flat, k_pe_expanded], dim=-1) # (128, 16, 192)
-        
-        # V
-        v_final = v.view(-1, layer.num_heads, layer.v_head_dim) # (128, 16, 128)
-        
-        # Reshape back to (B, S, H, D) for Ring Attention
-        q_ring = q_final.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
-        k_ring = k_final.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
-        v_ring = v_final.view(batch_size, seq_len, layer.num_heads, layer.v_head_dim)
-        
-        # --- Step B: Ring Attention ---
-        # ring_attention.py expects (B, S, H, D).
-        # We need mock module.
-        mock_module = MockModule(ring_pg, ulysses_pg, attn_type=AttnType.TORCH)
-        
-        # Sinks?
-        # Only used if has_sink?
-        # The kernel def: sinks: torch.Tensor,
-        # In ring_attention.py: sinks = sinks.chunk(...)
-        # We can pass dummy sinks if not using them or zeros.
-        sinks = torch.zeros(batch_size, layer.num_heads, 64, device=device, dtype=torch.bfloat16) # dummy
-        # Wait, kernel expects sinks to be [num_query_heads] in one place, or (B, H, Sinks)?
-        # `torch_attention_with_sinks_forward` uses sinks. 
-        # `triton_attention_forward` doc: `sinks_ptr`.
-        # For simplicity, pass zeros or empty. ring_attention.py takes `sinks`.
-        # Let's provide zeros.
-        
-        # Also need softmax_scale.
-        scale = layer.scaling
-        
-        # Ring Attention Call
-        # Ensure imports and updated code are used.
-        # The user updated `moreh_gpt_attention` (which calls `call_block_attn`).
-        # `moreh_gpt_attention` signature: (module, query, key, value, sinks, ..., causal, window_size)
-        
-        ring_out = moreh_gpt_attention(
-            mock_module,
-            q_ring,
-            k_ring,
-            v_ring,
-            sinks,
-            softmax_scale=scale,
-            causal=True,
-            window_size=(-1, -1),
-        )
-        # ring_out: (B, S, H, V_D) -> (1, 128, 16, 128)
-        
-        # --- Step C: Output Projection ---
-        # Flatten for linear
-        ring_out_flat = ring_out.reshape(-1, layer.num_heads * layer.v_head_dim)
-        final_ring_output = layer.o_proj(ring_out_flat)[0] # (128, Hidden)
-        
-        # Result is local. We need to gather to verify against global vanilla output.
-        # Gather all outputs
-        all_ring_outputs = [torch.zeros_like(final_ring_output) for _ in range(world_size)]
-        dist.all_gather(all_ring_outputs, final_ring_output, group=ring_pg)
-        
-        full_ring_output = torch.cat(all_ring_outputs, dim=0) # (256, Hidden)
-        
-        # Reshape to (B, TotalSeq, Hidden)
-        full_ring_output = full_ring_output.view(batch_size, total_seq_len, hidden_size)
-        
-    # --- 3. Compare ---
-    if rank == 0:
-        print(f"Vanilla Output Shape: {vanilla_output.shape}")
-        print(f"Ring Output Shape: {full_ring_output.shape}")
-        
-        # Close check
-        # BF16 might have some tolerance issues.
-        tolerance = 1e-2
-        diff = (vanilla_output - full_ring_output).abs().max().item()
-        mean_diff = (vanilla_output - full_ring_output).abs().mean().item()
-        print(f"Max Diff: {diff}")
-        print(f"Mean Diff: {mean_diff}")
-        
-        assert diff < tolerance, f"Mismatch! Max diff {diff} exceeds tolerance {tolerance}"
-        print("TEST PASSED: Vanilla MLA matches Manual CP Ring MLA.")
+        with torch.no_grad():
+            # MLA Logic extracted from forward_native
+            # 1. Down Projection (Wa)
+            qkv_lora = layer.fused_qkv_a_proj(local_hidden_states)[0]
+            q_c, kv_lora = qkv_lora.split(
+                [layer.q_lora_rank, layer.kv_lora_rank + layer.qk_rope_head_dim],
+                dim=-1
+            )
+            
+            # 2. Q Up Projection (Wb)
+            q_c = layer.q_a_layernorm(q_c)
+            q = layer.q_b_proj(q_c)[0]
+            q = q.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
+            
+            # 3. KV Split & Norm
+            kv_c, k_pe = kv_lora.split([layer.kv_lora_rank, layer.qk_rope_head_dim], dim=-1)
+            kv_c_normed = layer.kv_a_layernorm(kv_c)
+            
+            # 4. KV Up Projection (Wb) for Key Generation (for ring attn we need full keys/values)
+            # Wait, MLA usually keeps KV compressed. 
+            # But ring_attention.py expects: query, key, value tensors.
+            # "Vanilla MLA" = MLAAttention(use_sparse=False) -> uses cuda_impl/triton_impl
+            # If we use ring_attention, we need materialized K and V?
+            # Yes, ring_attention.py does standard attention. 
+            # MLA can be viewed as standard attention if we project K and V fully.
+            # K = [kv_c_normed @ W_Uk, k_pe]
+            # V = [kv_c_normed @ W_Uv]
+            
+            # layer.kv_b_proj projects to (qk_nope_head_dim + v_head_dim)
+            # It takes kv_c_normed
+            kv_up = layer.kv_b_proj(kv_c_normed)[0]
+            kv_up = kv_up.view(batch_size, seq_len, layer.num_heads, layer.qk_nope_head_dim + layer.v_head_dim)
+            k_nope, v = kv_up.split([layer.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+            
+            # 5. RoPE
+            # k_pe needs to be expanded/repeated?
+            # In forward_native:
+            # k_pe = k_pe.unsqueeze(1) (batch, 1, seq, dim) ? No, typically (batch, seq, head, dim) or sim.
+            # In forward_native: k_pe = k_pe.unsqueeze(1) -> (B, 1, S, D) ?
+            # Let's check code:
+            # k_pe = k_pe.unsqueeze(1)
+            # rotary_emb(positions, q[..., nope:], k_pe)
+            # q shape is (B*S, H, D) flattened or (B, S, H, D) depending on impl.
+            # Here we reshaped to (B, S, H, D).
+            
+            # Apply RoPE
+            q_nope = q[..., :layer.qk_nope_head_dim]
+            q_pe = q[..., layer.qk_nope_head_dim:]
+            
+            # k_pe comes from latent, shape (B, S, D_rope).
+            # We need to broadcast it to heads?
+            # In MLA, k_pe is shared across heads usually (Multi-Query for PE part).
+            # Wrapper says: k_pe = k_pe.unsqueeze(1) before rotary.
+            # `rotary_emb` handles the broadcasting if needed?
+            
+            # vllm rotary: forward(positions, q, k)
+            # positions: (B, S)
+            # q: (B, S, H, D) or (B, H, S, D)?
+            # wrapper.forward_native:
+            # q = q.view(-1, self.num_heads, self.qk_head_dim) # (TotalTokens, H, D)
+            # positions flattened.
+            # We are using batch mode here for ring attention.
+            
+            # Let's simulate flattening for RoPE to match vLLM utility if needed, or just map carefully.
+            # vLLM rope expects (num_tokens, num_heads, head_size).
+            
+            # Let's verify shapes.
+            # q: (1, 128, 16, 192) -> view -> (128, 16, 192)
+            q_flat = q.view(-1, layer.num_heads, layer.qk_head_dim)
+            
+            k_pe_flat = k_pe.reshape(-1, 1, layer.qk_rope_head_dim) # (128, 1, 64)
+            
+            q_nope_flat = q_flat[..., :layer.qk_nope_head_dim]
+            q_pe_flat = q_flat[..., layer.qk_nope_head_dim:]
+            
+            positions_flat = local_positions.view(-1)
+            
+            q_pe_rot, k_pe_rot = layer.rotary_emb(positions_flat, q_pe_flat, k_pe_flat)
+            
+            # Re-assemble Q
+            q_final = torch.cat([q_nope_flat, q_pe_rot], dim=-1) # (128, 16, 192)
+            
+            # Re-assemble K
+            # K consists of k_nope and k_pe_rot.
+            # k_nope comes from kv_up (B, S, H, D_nope). 
+            # k_pe_rot is (B*S, 1, D_rope). We need to broadcast k_pe to H heads?
+            # Yes, MLA uses shared PE.
+            # But for Ring Attention (standard MHA kernel), we need materialized K per head.
+            k_nope_flat = k_nope.view(-1, layer.num_heads, layer.qk_nope_head_dim)
+            k_pe_expanded = k_pe_rot.expand(-1, layer.num_heads, -1)
+            k_final = torch.cat([k_nope_flat, k_pe_expanded], dim=-1) # (128, 16, 192)
+            
+            # V
+            v_final = v.view(-1, layer.num_heads, layer.v_head_dim) # (128, 16, 128)
+            
+            # Reshape back to (B, S, H, D) for Ring Attention
+            q_ring = q_final.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
+            k_ring = k_final.view(batch_size, seq_len, layer.num_heads, layer.qk_head_dim)
+            v_ring = v_final.view(batch_size, seq_len, layer.num_heads, layer.v_head_dim)
+            
+            # --- Step B: Ring Attention ---
+            # ring_attention.py expects (B, S, H, D).
+            # We need mock module.
+            mock_module = MockModule(ring_pg, ulysses_pg, attn_type=AttnType.TORCH)
+            
+            # Sinks?
+            # Only used if has_sink?
+            # The kernel def: sinks: torch.Tensor,
+            # In ring_attention.py: sinks = sinks.chunk(...)
+            # We can pass dummy sinks if not using them or zeros.
+            sinks = torch.zeros(batch_size, layer.num_heads, 64, device=device, dtype=torch.bfloat16) # dummy
+            # Wait, kernel expects sinks to be [num_query_heads] in one place, or (B, H, Sinks)?
+            # `torch_attention_with_sinks_forward` uses sinks. 
+            # `triton_attention_forward` doc: `sinks_ptr`.
+            # For simplicity, pass zeros or empty. ring_attention.py takes `sinks`.
+            # Let's provide zeros.
+            
+            # Also need softmax_scale.
+            scale = layer.scaling
+            
+            # Ring Attention Call
+            # Ensure imports and updated code are used.
+            # The user updated `moreh_gpt_attention` (which calls `call_block_attn`).
+            # `moreh_gpt_attention` signature: (module, query, key, value, sinks, ..., causal, window_size)
+            
+            ring_out = moreh_gpt_attention(
+                mock_module,
+                q_ring,
+                k_ring,
+                v_ring,
+                sinks,
+                softmax_scale=scale,
+                causal=True,
+                window_size=(-1, -1),
+            )
+            # ring_out: (B, S, H, V_D) -> (1, 128, 16, 128)
+            
+            # --- Step C: Output Projection ---
+            # Flatten for linear
+            ring_out_flat = ring_out.reshape(-1, layer.num_heads * layer.v_head_dim)
+            final_ring_output = layer.o_proj(ring_out_flat)[0] # (128, Hidden)
+            
+            # Result is local. We need to gather to verify against global vanilla output.
+            # Gather all outputs
+            all_ring_outputs = [torch.zeros_like(final_ring_output) for _ in range(world_size)]
+            dist.all_gather(all_ring_outputs, final_ring_output, group=ring_pg)
+            
+            full_ring_output = torch.cat(all_ring_outputs, dim=0) # (256, Hidden)
+            
+            # Reshape to (B, TotalSeq, Hidden)
+            full_ring_output = full_ring_output.view(batch_size, total_seq_len, hidden_size)
+            
+        # --- 3. Compare ---
+        if rank == 0:
+            print(f"Vanilla Output Shape: {vanilla_output.shape}")
+            print(f"Ring Output Shape: {full_ring_output.shape}")
+            
+            # Close check
+            # BF16 might have some tolerance issues.
+            tolerance = 1e-2
+            diff = (vanilla_output - full_ring_output).abs().max().item()
+            mean_diff = (vanilla_output - full_ring_output).abs().mean().item()
+            print(f"Max Diff: {diff}")
+            print(f"Mean Diff: {mean_diff}")
+            
+            assert diff < tolerance, f"Mismatch! Max diff {diff} exceeds tolerance {tolerance}"
+            print("TEST PASSED: Vanilla MLA matches Manual CP Ring MLA.")
 
     dist.barrier()
     parallel_state.destroy_model_parallel()
