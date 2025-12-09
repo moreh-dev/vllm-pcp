@@ -161,6 +161,15 @@ def run_test(rank, world_size):
             max_position_embeddings=4096,
             cache_config=cache_config,
         ).to(device).to(torch.bfloat16)
+
+        # User requested random initialization instead of zero
+        def init_weights(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+        
+        layer.apply(init_weights)
         
         # Create Inputs
         batch_size = 1
