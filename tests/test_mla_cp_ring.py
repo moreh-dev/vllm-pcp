@@ -60,6 +60,15 @@ def get_vllm_config():
     vllm_config.cache_config = cache_config
     vllm_config.scheduler_config = scheduler_config
     vllm_config.quant_config = None
+    
+    # Needs parallel_config for forward_context checks
+    from vllm.config import ParallelConfig
+    parallel_config = MagicMock(spec=ParallelConfig)
+    parallel_config.data_parallel_size = 1
+    parallel_config.pipeline_parallel_size = 1
+    parallel_config.tensor_parallel_size = 1
+    vllm_config.parallel_config = parallel_config
+
     # Use a real CompilationConfig or fully mocked one with required attributes
     # CustomOp checks custom_ops list count of "all"/"none"
     # It also checks mode
