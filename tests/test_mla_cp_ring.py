@@ -198,6 +198,7 @@ def run_test(rank, world_size):
             prefill_meta = MagicMock()
             prefill_meta.query_start_loc = query_start_loc
             prefill_meta.max_query_len = total_seq_len
+            prefill_meta.chunked_context = None
             attn_metadata.prefill = prefill_meta
             
             # Also set top-level for safety if used elsewhere
