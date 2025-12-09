@@ -180,7 +180,7 @@ def run_test(rank, world_size):
             attn_metadata.num_prefills = 1
             attn_metadata.num_decode_tokens = 0
             # Ensure static_forward_context is populated
-            assert layer.mla_attn.layer_name in vllm_config.compilation_config.static_forward_context
+            assert layer.mla_attn.mla_attn.layer_name in vllm_config.compilation_config.static_forward_context
             
             with set_forward_context(attn_metadata, vllm_config):
                 vanilla_output = layer(positions, global_hidden_states)
