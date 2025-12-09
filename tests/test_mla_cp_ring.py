@@ -187,9 +187,13 @@ def run_test(rank, world_size):
             # Mock metadata
             attn_metadata = MagicMock()
             attn_metadata.num_prefills = 1
-            attn_metadata.num_prefill_tokens = 128
+            attn_metadata.num_prefill_tokens = total_seq_len
             attn_metadata.num_decode_tokens = 0
             attn_metadata.num_decodes = 0
+            attn_metadata.max_prefill_seq_len = total_seq_len
+            # query_start_loc is cu_seqlens_q: [0, seq_len] for batch size 1
+            attn_metadata.query_start_loc = torch.tensor([0, total_seq_len], dtype=torch.int32, device=device)
+            attn_metadata.seq_lens_tensor = torch.tensor([total_seq_len], dtype=torch.int32, device=device)
             # Ensure static_forward_context is populated
             # Ensure static_forward_context is populated
             assert layer.mla_attn.mla_attn.layer_name in vllm_config.compilation_config.static_forward_context
