@@ -521,6 +521,7 @@ def call_block_attn(
     # Padding for MLA where qk_head_dim != v_head_dim
     # q, k: [bs, seqlen, num_heads, qk_head_dim]
     # v: [bs, seqlen, num_heads, v_head_dim]
+    original_v_head_dim = value.shape[-1]
     if value.shape[-1] != query.shape[-1]:
         pad_len = query.shape[-1] - value.shape[-1]
         value = F.pad(value, (0, pad_len))
@@ -553,6 +554,10 @@ def call_block_attn(
         )
     else:
         raise ValueError(f"Unsupported attention type: {attn}")
+
+    if out.shape[-1] != original_v_head_dim:
+        out = out[..., :original_v_head_dim]
+
     return out, lse
 
 
