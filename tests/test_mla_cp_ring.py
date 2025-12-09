@@ -163,13 +163,14 @@ def run_test(rank, world_size):
         ).to(device).to(torch.bfloat16)
 
         # User requested random initialization instead of zero
-        def init_weights(m):
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-        
-        layer.apply(init_weights)
+        # Explicitly init parallel layers as they don't inherit from nn.Linear
+        for module_name in ["fused_qkv_a_proj", "q_b_proj", "kv_b_proj", "o_proj"]:
+            if hasattr(layer, module_name):
+                module = getattr(layer, module_name)
+                if module is not None and hasattr(module, "weight"):
+                     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module is not None and hasattr(module, "bias") and module.bias is not None:
+                     torch.nn.init.zeros_(module.bias)
         
         # Create Inputs
         batch_size = 1
