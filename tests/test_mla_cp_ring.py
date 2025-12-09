@@ -187,7 +187,10 @@ def run_test(rank, world_size):
             # Mock metadata
             attn_metadata = MagicMock()
             attn_metadata.num_prefills = 1
+            attn_metadata.num_prefill_tokens = 128
             attn_metadata.num_decode_tokens = 0
+            attn_metadata.num_decodes = 0
+            # Ensure static_forward_context is populated
             # Ensure static_forward_context is populated
             assert layer.mla_attn.mla_attn.layer_name in vllm_config.compilation_config.static_forward_context
             
