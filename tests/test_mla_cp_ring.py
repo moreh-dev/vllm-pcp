@@ -84,6 +84,9 @@ def run_test(rank, world_size):
     # Setup distributed
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
+    os.environ['RANK'] = str(rank)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
     
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank}")
