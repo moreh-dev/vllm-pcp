@@ -148,14 +148,9 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
 
         if self.rotary_emb is not None:
-            # DEBUG PRINTS
-            print(f"DEBUG: positions shape={positions.shape}")
-            print(f"DEBUG: q shape={q[..., self.qk_nope_head_dim :].shape}")
-            print(f"DEBUG: k_pe shape={k_pe.shape}")
-            print(f"DEBUG: rotary_emb type={type(self.rotary_emb)}")
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
