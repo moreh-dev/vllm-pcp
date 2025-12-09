@@ -194,6 +194,7 @@ from enum import Enum
 from typing import ClassVar, Generic, TypeVar
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from vllm import _custom_ops as ops
@@ -209,7 +210,7 @@ from vllm.attention.ops.common import cp_lse_ag_out_rs
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
+from vllm.distributed.parallel_state import get_dcp_group, get_up_group, is_global_first_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -355,6 +356,7 @@ class MLACommonPrefillMetadata:
     max_query_len: int
     chunked_context: ChunkedContextMetadata | None = None
     query_seq_lens: torch.Tensor | None = None
+    query_seq_lens_cpu: torch.Tensor | None = None
 
 
 @dataclass
@@ -543,10 +545,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
+            self.up_world_size = get_up_group().world_size
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+            self.up_world_size = 1
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
 
@@ -975,6 +979,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
                 )
 
+            if self.up_world_size > 1:
+                prefill_metadata.query_seq_lens_cpu = query_seq_lens_cpu[reqs_start:]
+
         decode_metadata = None
         if num_decodes > 0:
             dcp_tot_seq_lens_device = None
@@ -1313,6 +1320,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             )
 
         self.dcp_world_size: int | None = None
+        self.up_world_size: int | None = None
 
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
@@ -1323,8 +1331,136 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
 
+    def _ulysses_qkv_all_to_all(self, q, k, v, bounds, lengths):
+        """
+        Perform Ulysses all-to-all on Q, K, V tensors.
+        Transforms from sequence-parallel to head-parallel layout.
+
+        Args:
+            q, k, v: [total_tokens, num_heads, head_dim]
+            bounds: query_start_loc (GPU tensor, cumulative positions)
+            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+
+        Returns:
+            q, k, v: [total_tokens, num_heads/up_world_size, head_dim]
+        """
+        # Early exit if UP disabled
+        if self.up_world_size == 1:
+            return q, k, v
+
+        # [total_tokens, num_heads, head_dim]
+        assert q.dim() == k.dim() == v.dim() == 3
+
+        num_reqs = len(lengths)
+
+        # Split into per-request chunks
+        q_list, k_list, v_list = [], [], []
+        for i in range(num_reqs):
+            q_list.append(q.narrow(0, bounds[i], lengths[i]))
+            k_list.append(k.narrow(0, bounds[i], lengths[i]))
+            v_list.append(v.narrow(0, bounds[i], lengths[i]))
+
+        q_out_list, k_out_list, v_out_list = [], [], []
+
+        for i in range(num_reqs):
+            # Stack q, k, v: [3, seq, heads, dim]
+            qkv = torch.stack([q_list[i], k_list[i], v_list[i]], dim=0)
+
+            # Reshape: [3, seq, heads, dim] -> [3, seq, up_size, heads/up_size, dim]
+            qkv_reshaped = qkv.reshape(
+                3,
+                qkv.shape[1],
+                self.up_world_size,
+                qkv.shape[2] // self.up_world_size,
+                qkv.shape[3]
+            )
+
+            # Transpose: [3, seq, up_size, heads/up_size, dim] -> [up_size, seq, 3, heads/up_size, dim]
+            qkv_reshaped = qkv_reshaped.transpose(0, 2).contiguous()
+
+            qkv_output = torch.empty_like(qkv_reshaped)
+
+            # Single all_to_all_single call
+            dist.all_to_all_single(qkv_output, qkv_reshaped, group=get_up_group().device_group)
+
+            # Reshape: [up_size, seq/up_size, 3, heads/up_size, dim] -> [seq, 3, heads/up_size, dim]
+            qkv_out = qkv_output.reshape(-1, 3, qkv_output.shape[3], qkv_output.shape[4])
+
+            # Transpose: [seq, 3, heads/up_size, dim] -> [3, seq, heads/up_size, dim]
+            qkv_out = qkv_out.transpose(0, 1).contiguous()
+
+            # Unpack
+            q_out, k_out, v_out = qkv_out[0], qkv_out[1], qkv_out[2]
+
+            q_out_list.append(q_out)
+            k_out_list.append(k_out)
+            v_out_list.append(v_out)
+
+        return torch.cat(q_out_list, dim=0), torch.cat(k_out_list, dim=0), torch.cat(v_out_list, dim=0)
+
+    def _ulysses_output_all_to_all(self, output, bounds, lengths):
+        """
+        Perform Ulysses all-to-all on output tensor (inverse of QKV all-to-all).
+        Transforms from head-parallel to sequence-parallel layout.
+
+        Args:
+            output: [total_tokens, num_heads/up_world_size, head_dim]
+            bounds: query_start_loc (GPU tensor, cumulative positions)
+            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+
+        Returns:
+            output: [total_tokens/up_world_size, num_heads, head_dim]
+        """
+        # Early exit if UP disabled
+        if self.up_world_size == 1:
+            return output
+
+        # [total_tokens, num_heads/up_world_size, head_dim]
+        assert output.dim() == 3
+
+        num_reqs = len(lengths)
+
+        # Split into per-request chunks
+        output_list = []
+        for i in range(num_reqs):
+            output_list.append(output.narrow(0, bounds[i], lengths[i] * self.up_world_size))
+
+        output_out_list = []
+
+        for i in range(num_reqs):
+            # [seq, heads/up_size, dim] -> [up_size, seq/up_size, heads/up_size, dim]
+            output_reshaped = output_list[i].reshape(
+                self.up_world_size,
+                output_list[i].shape[0] // self.up_world_size,
+                output_list[i].shape[1],
+                output_list[i].shape[2]
+            )
+
+            # Transpose to [up_size, heads/up_size, seq/up_size, dim]
+            output_reshaped = output_reshaped.transpose(1, 2).contiguous()
+
+            output_gathered = torch.empty_like(output_reshaped)
+
+            dist.all_to_all_single(output_gathered, output_reshaped, group=get_up_group().device_group)
+
+            # Reshape to [heads, seq/up_size, dim]
+            result = output_gathered.reshape(
+                self.up_world_size * output_list[i].shape[1],  # heads
+                output_gathered.shape[2],  # seq/up_size
+                output_gathered.shape[3]   # dim
+            )
+
+            # Transpose to [seq/up_size, heads, dim]
+            result = result.transpose(0, 1).contiguous()
+
+            output_out_list.append(result)
+
+        return torch.cat(output_out_list, dim=0)
+
     def _flash_attn_varlen_diff_headdims(
-        self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
+        self, q, k, v,
+        query_seq_lens_cpu=None,
+        return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
         maybe_padded_v = v
         if self._pad_v:
@@ -1341,6 +1477,10 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         if vllm_is_batch_invariant():
             kwargs["num_splits"] = 1
 
+        if self.up_world_size > 1 and query_seq_lens_cpu is not None:
+            bounds = kwargs['cu_seqlens_q']
+            q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(q, k, maybe_padded_v, bounds, query_seq_lens_cpu)
+
         attn_out = self.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1353,6 +1493,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         lse = None
         if isinstance(attn_out, tuple):
             attn_out, lse = attn_out[0], attn_out[1]
+
+        if self.up_world_size > 1 and query_seq_lens_cpu is not None:
+            attn_out = self._ulysses_output_all_to_all(attn_out, bounds, query_seq_lens_cpu)
 
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
@@ -1367,6 +1510,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             q=q,
             k=k,
             v=v,
+            query_seq_lens_cpu=prefill.query_seq_lens_cpu,
             cu_seqlens_q=prefill.query_start_loc,
             cu_seqlens_k=prefill.query_start_loc,
             max_seqlen_q=prefill.max_query_len,
@@ -1928,6 +2072,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         if self.dcp_world_size is None:
             self.dcp_world_size = get_dcp_group().world_size
+
+        if self.up_world_size is None:
+            self.up_world_size = get_up_group().world_size
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
