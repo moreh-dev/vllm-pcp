@@ -112,6 +112,7 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        positions = positions.view(-1)
         q_c = None
         kv_lora = None
 
@@ -150,6 +151,11 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
+            # DEBUG PRINTS
+            print(f"DEBUG: positions shape={positions.shape}")
+            print(f"DEBUG: q shape={q[..., self.qk_nope_head_dim :].shape}")
+            print(f"DEBUG: k_pe shape={k_pe.shape}")
+            print(f"DEBUG: rotary_emb type={type(self.rotary_emb)}")
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
