@@ -1971,6 +1971,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         if has_prefill:
+            """
             self._forward_prefill(
                 prefill_q,
                 prefill_k_c_normed,
@@ -1980,6 +1981,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 layer._k_scale,
                 output=output[num_decode_tokens:],
             )
+            """
 
         if has_decode:
             assert attn_metadata.decode is not None

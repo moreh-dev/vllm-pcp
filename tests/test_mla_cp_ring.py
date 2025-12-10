@@ -112,8 +112,8 @@ def run_test(rank, world_size):
     parallel_state.ensure_model_parallel_initialized(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        #ring_model_parallel_size=world_size,  # Optional: mirrors the user's note about RP group
-        ring_model_parallel_size=1
+        ring_model_parallel_size=world_size,  # Optional: mirrors the user's note about RP group
+        #ring_model_parallel_size=1
     )
     
     # Create Process Groups
@@ -220,10 +220,11 @@ def run_test(rank, world_size):
             attn_metadata.max_prefill_seq_len = total_seq_len
             # Ensure static_forward_context is populated
             # Ensure static_forward_context is populated
+            print (f'attn_metadata: {attn_metadata}')
             assert layer.mla_attn.mla_attn.layer_name in vllm_config.compilation_config.static_forward_context
             
             with set_forward_context(attn_metadata, vllm_config):
-                vanilla_output = layer(positions, global_hidden_states)
+                vanilla_output = layer(positions, global_hidden_states.view(batch_size * total_seq_len, hidden_size))
         
         # --- 2. Ring Attention Forward ---
         # Prepare Local Input
@@ -241,7 +242,11 @@ def run_test(rank, world_size):
         with torch.no_grad():
             # MLA Logic extracted from forward_native
             # 1. Down Projection (Wa)
+            print (f'local_hidden_states: {local_hidden_states}')
+            print (f'weight: {layer.fused_qkv_a_proj.weight}')
+            print (type(layer.fused_qkv_a_proj))
             qkv_lora = layer.fused_qkv_a_proj(local_hidden_states)[0]
+            print (f'qkv_lora: {qkv_lora}')
             q_c, kv_lora = qkv_lora.split(
                 [layer.q_lora_rank, layer.kv_lora_rank + layer.qk_rope_head_dim],
                 dim=-1
@@ -395,7 +400,7 @@ def run_test(rank, world_size):
             print(f"Vanilla Output Shape: {vanilla_output.shape}")
             print(f"Ring Output Shape: {full_ring_output.shape}")
             
-            # Close check
+            # Close check   
             # BF16 might have some tolerance issues.
             tolerance = 1e-2
             diff = (vanilla_output - full_ring_output).abs().max().item()

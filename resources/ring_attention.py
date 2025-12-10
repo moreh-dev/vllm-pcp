@@ -528,6 +528,11 @@ def call_block_attn(
 
     attn = "flash"
 
+    print (f'shape of query: {query.shape}')
+    print (f'shape of key: {key.shape}')
+    print (f'shape of value: {value.shape}')
+    print (f'shape of sinks: {sinks.shape}')
+
     if window_size != (-1, -1):
         attn = "triton"
 
@@ -536,7 +541,6 @@ def call_block_attn(
             query,
             key,
             value,
-            sinks,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
@@ -547,7 +551,6 @@ def call_block_attn(
             query,
             key,
             value,
-            sinks,
             scale=softmax_scale,
             is_causal=causal,
             window_size=window_size,
@@ -632,6 +635,7 @@ def moreh_gpt_attention(
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             with torch.cuda.stream(comm_stream):
+                print (f'next_k shape: {next_k.shape}')
                 comm.commit()
 
         key, value = key_layer, value_layer
