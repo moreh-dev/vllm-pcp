@@ -1337,18 +1337,18 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         Transforms from sequence-parallel to head-parallel layout.
 
         Args:
-            q, k, v: [total_tokens, num_heads, head_dim]
+            q, k, v: [seq/up_size, heads, dim]
             bounds: query_start_loc (GPU tensor, cumulative positions)
             lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
 
         Returns:
-            q, k, v: [total_tokens, num_heads/up_world_size, head_dim]
+            q, k, v: [seq, heads/up_size, dim]
         """
         # Early exit if UP disabled
         if self.up_world_size == 1:
             return q, k, v
 
-        # [total_tokens, num_heads, head_dim]
+        # [seq/up_size, heads, dim]
         assert q.dim() == k.dim() == v.dim() == 3
 
         num_reqs = len(lengths)
@@ -1363,10 +1363,10 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         q_out_list, k_out_list, v_out_list = [], [], []
 
         for i in range(num_reqs):
-            # Stack q, k, v: [3, seq, heads, dim]
+            # Stack q, k, v: [3, seq/up_size, heads, dim]
             qkv = torch.stack([q_list[i], k_list[i], v_list[i]], dim=0)
 
-            # Reshape: [3, seq, heads, dim] -> [3, seq, up_size, heads/up_size, dim]
+            # Reshape: [3, seq/up_size, heads, dim] -> [3, seq/up_size, up_size, heads/up_size, dim]
             qkv_reshaped = qkv.reshape(
                 3,
                 qkv.shape[1],
@@ -1375,7 +1375,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 qkv.shape[3]
             )
 
-            # Transpose: [3, seq, up_size, heads/up_size, dim] -> [up_size, seq, 3, heads/up_size, dim]
+            # Transpose: [3, seq/up_size, up_size, heads/up_size, dim] -> [up_size, seq/up_size, 3, heads/up_size, dim]
             qkv_reshaped = qkv_reshaped.transpose(0, 2).contiguous()
 
             qkv_output = torch.empty_like(qkv_reshaped)
@@ -1404,18 +1404,18 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         Transforms from head-parallel to sequence-parallel layout.
 
         Args:
-            output: [total_tokens, num_heads/up_world_size, head_dim]
+            output: [seq, heads/up_size, dim]
             bounds: query_start_loc (GPU tensor, cumulative positions)
             lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
 
         Returns:
-            output: [total_tokens/up_world_size, num_heads, head_dim]
+            output: [seq/up_size, heads, dim]
         """
         # Early exit if UP disabled
         if self.up_world_size == 1:
             return output
 
-        # [total_tokens, num_heads/up_world_size, head_dim]
+        # [seq, heads/up_size, dim]
         assert output.dim() == 3
 
         num_reqs = len(lengths)
@@ -1480,6 +1480,10 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         if self.up_world_size > 1 and query_seq_lens_cpu is not None:
             bounds = kwargs['cu_seqlens_q']
             q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(q, k, maybe_padded_v, bounds, query_seq_lens_cpu)
+            kwargs['cu_seqlens_q'] = kwargs['cu_seqlens_q'] * self.up_world_size
+            kwargs['cu_seqlens_k'] = kwargs['cu_seqlens_k'] * self.up_world_size
+            kwargs['max_seqlen_q'] = kwargs['max_seqlen_q'] * self.up_world_size
+            kwargs['max_seqlen_k'] = kwargs['max_seqlen_k'] * self.up_world_size
 
         attn_out = self.flash_attn_varlen_func(
             q=q,
