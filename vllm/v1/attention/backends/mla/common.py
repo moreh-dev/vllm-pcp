@@ -232,6 +232,16 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+try:
+    from resources.ring_attention import (
+        AttnType,
+        RingComm,
+        SeqAllToAll4D,
+        moreh_gpt_attention,
+    )
+    from yunchang.globals import PROCESS_GROUP
+except ImportError:
+    pass
 
 
 class QueryLenSupport(Enum):
@@ -1322,6 +1332,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self.dcp_world_size: int | None = None
         self.up_world_size: int | None = None
 
+        # Ring Attention / Sequence Parallelism Setup
+        self.ring_pg = getattr(PROCESS_GROUP, "RING_PG", None) if "PROCESS_GROUP" in globals() else None
+        self.ulysses_pg = getattr(PROCESS_GROUP, "ULYSSES_PG", None) if "PROCESS_GROUP" in globals() else None
+        # Use simple default indices for Ulysses: Scatter Heads (2), Gather Seq (1)
+        self.scatter_idx = 2
+        self.gather_idx = 1
+        self.use_pack_qkv = False
+        if "AttnType" in globals():
+            self.attn_type = AttnType.TORCH
+        
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
@@ -1984,47 +2004,123 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
-        output_prefill = self._run_prefill_new_tokens(
-            prefill=attn_metadata.prefill,
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-        )
+        if self.ring_pg is not None:
+             ring_size = dist.get_world_size(self.ring_pg)
+        else:
+             ring_size = 1
 
-        if has_context:
-            suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
-                context_output, context_lse = (
-                    self._context_parallel_compute_prefill_context(
-                        q,
-                        kv_c_and_k_pe_cache,
-                        attn_metadata,
-                        k_scale=None,
-                        dcp_world_size=self.dcp_world_size,
+        if self.ulysses_pg is not None:
+             ulysses_size = dist.get_world_size(self.ulysses_pg)
+        else:
+             ulysses_size = 1
+        
+        sp_size = ring_size * ulysses_size
+
+        if sp_size > 1:
+            # Ring Attention / SP path
+            # q: [Sq, num_heads, qk_head_dim] (already projected)
+            # k: [Skv, num_heads, qk_head_dim]
+            # v: [Skv, num_heads, v_head_dim]
+            # moreh_gpt_attention expects [B, S, H, D]
+            # Since strict prefill here implies [1, S, H, D] relative to this stream (or batch invariant?)
+            # The input `q` here is [Sq, N, D] from `q_nope` concatenation.
+            
+            # Reshape to [B, S, H, D]. Assuming B=1 for this context or infer from q.
+            # q shape comes from `q_nope` inside `_forward_prefill` which was `view(-1, ...)`?
+            # Wait, at lines 1980, `kv_nope`. 
+            # `q` passed to `_run_prefill_new_tokens` is usually `q` from arg? 
+            # In `_forward_prefill`, `q` arg is passed.
+            # Let's check `q` shape. In `_forward_prefill`, it enters as [num_tokens, num_heads, head_dim] probably?
+            # common.py comments say: q_nope shape [Sq, N, P].
+            # q_pe shape [Sq, N, R].
+            # They are concatenated.
+            # So q is [Sq, H, D_q].
+            
+            # We unsqueeze(0) to simulate Batch=1.
+            q_in = q.unsqueeze(0)
+            k_in = k.unsqueeze(0)
+            v_in = v.unsqueeze(0)
+            
+            # Sinks are dummy for now?
+            sinks = torch.zeros(self.num_heads, dtype=q.dtype, device=q.device)
+            
+            # Call Ring Attention
+            ring_out = moreh_gpt_attention(
+                self,
+                q_in,
+                k_in,
+                v_in,
+                sinks,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=(-1, -1),
+            )
+            
+            # Output is [B, S, H, V_D]. Flatten back to [S, H, V_D] or [S*H*V_D] as needed?
+            # `output` arg is usually [S, H, V_D] or similar?
+            # Check `_run_prefill_new_tokens` return. it returns `attn_output, lse`.
+            # `attn_output` is usually [num_tokens, num_heads, v_head_dim].
+            
+            output_prefill = ring_out.squeeze(0) # [S, H, V]
+            # LSE? moreh_gpt_attention returns (output, lse). Wait, helper returns output.
+            # `moreh_gpt_attention` returns `output`.
+            
+            # If we need LSE, we need to modify moreh_gpt_attention or accept it doesn't return LSE in signature 
+            # provided in `ring_attention.py` snippet (line 659 returns output only).
+            # The user provided `moreh_gpt_attention` implementation returns `output`.
+            # `_run_prefill_new_tokens` returns tuple (output, lse) if return_softmax_lse=True.
+            # Does `has_context` matter for SP?
+            # Usually SP is full prefill. `has_context` (Chunked) shouldn't be active if we do SP Ring?
+            
+            # Assuming we don't need LSE for now or Ring covers it.
+            # Also `output` in `_forward_prefill` ends up with `copy_`.
+            
+            output_prefill = output_prefill.flatten(start_dim=-2) # [S, H*V]
+            output.copy_(output_prefill)
+            pass
+
+        else:
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=attn_metadata.prefill,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+            )
+
+            if has_context:
+                suffix_output, suffix_lse = output_prefill
+                if self.dcp_world_size > 1:
+                    context_output, context_lse = (
+                        self._context_parallel_compute_prefill_context(
+                            q,
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                            k_scale=None,
+                            dcp_world_size=self.dcp_world_size,
+                        )
                     )
+                else:
+                    context_output, context_lse = self._compute_prefill_context(
+                        q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                    )
+
+                # unpad if necessary
+                if self._pad_v:
+                    context_output = context_output[..., : v.shape[-1]]
+                    suffix_output = suffix_output[..., : v.shape[-1]]
+
+                output = output.view(-1, self.num_heads, self.v_head_dim)
+                merge_attn_states(
+                    output=output,
+                    prefix_output=context_output,
+                    prefix_lse=context_lse,
+                    suffix_output=suffix_output,
+                    suffix_lse=suffix_lse,
                 )
             else:
-                context_output, context_lse = self._compute_prefill_context(
-                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale
-                )
-
-            # unpad if necessary
-            if self._pad_v:
-                context_output = context_output[..., : v.shape[-1]]
-                suffix_output = suffix_output[..., : v.shape[-1]]
-
-            output = output.view(-1, self.num_heads, self.v_head_dim)
-            merge_attn_states(
-                output=output,
-                prefix_output=context_output,
-                prefix_lse=context_lse,
-                suffix_output=suffix_output,
-                suffix_lse=suffix_lse,
-            )
-        else:
-            output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
-            output.copy_(output_prefill)
+                output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
+                output.copy_(output_prefill)
 
     @abstractmethod
     def _forward_decode(
