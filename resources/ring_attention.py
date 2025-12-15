@@ -608,16 +608,9 @@ def moreh_gpt_attention(
         received_tensor += 1.0
         _WARMUPED = True
 
-    if ulysses_size > 1:
-        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
-        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
-        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
-        ulysses_rank = dist.get_rank(module.ulysses_pg)
-        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
-    else:
-        query_layer = query
-        key_layer = key
-        value_layer = value
+    query_layer = query
+    key_layer = key
+    value_layer = value
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
@@ -675,10 +668,7 @@ def moreh_gpt_attention(
             value_layer = next_v
 
     out = out.to(query.dtype)
-    if dist.get_world_size(module.ulysses_pg) > 1:
-        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
-    else:
-        output = out
+    output = out
 
     return output
 
@@ -724,16 +714,9 @@ def _moreh_gpt_attention_balanced_window(
             received_tensor += 1.0
         _WARMUPED = True
 
-    if ulysses_size > 1:
-        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
-        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
-        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
-        ulysses_rank = dist.get_rank(module.ulysses_pg)
-        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
-    else:
-        query_layer = query
-        key_layer = key
-        value_layer = value
+    query_layer = query
+    key_layer = key
+    value_layer = value
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))

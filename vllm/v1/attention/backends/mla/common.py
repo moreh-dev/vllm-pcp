@@ -2022,37 +2022,29 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         if sp_size > 1:
             # Ring Attention / SP path
-            # q: [Sq, num_heads, qk_head_dim] (already projected)
-            # k: [Skv, num_heads, qk_head_dim]
-            # v: [Skv, num_heads, v_head_dim]
-            # moreh_gpt_attention expects [B, S, H, D]
-            # Since strict prefill here implies [1, S, H, D] relative to this stream (or batch invariant?)
-            # The input `q` here is [Sq, N, D] from `q_nope` concatenation.
             
-            # Reshape to [B, S, H, D]. Assuming B=1 for this context or infer from q.
-            # q shape comes from `q_nope` inside `_forward_prefill` which was `view(-1, ...)`?
-            # Wait, at lines 1980, `kv_nope`. 
-            # `q` passed to `_run_prefill_new_tokens` is usually `q` from arg? 
-            # In `_forward_prefill`, `q` arg is passed.
-            # Let's check `q` shape. In `_forward_prefill`, it enters as [num_tokens, num_heads, head_dim] probably?
-            # common.py comments say: q_nope shape [Sq, N, P].
-            # q_pe shape [Sq, N, R].
-            # They are concatenated.
-            # So q is [Sq, H, D_q].
-            
-            # We unsqueeze(0) to simulate Batch=1.
-            q_in = q.unsqueeze(0)
-            k_in = k.unsqueeze(0)
-            v_in = v.unsqueeze(0)
+            q_in = q
+            k_in = k
+            v_in = v
             
             # Sinks are dummy for now?
             sinks = torch.zeros(self.num_heads, dtype=q.dtype, device=q.device)
             sinks.fill_(float('-inf'))
+
+            if ulysses_size > 1:
+                bounds = attn_metadata.prefill.query_start_loc
+                lengths = attn_metadata.prefill.query_seq_lens_cpu
+                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, v_in, bounds, lengths)
+                
+                ulysses_rank = dist.get_rank(self.ulysses_pg)
+                sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
             
+            # Reshape to [B, S, H, D]. Assuming B=1 for this context.
+            q_in = q_in.unsqueeze(0)
+            k_in = k_in.unsqueeze(0)
+            v_in = v_in.unsqueeze(0)
+
             # Call Ring Attention
-            print (f'calling moreh_gpt_attention, shape: {q_in.shape}, {k_in.shape}, {v_in.shape}', flush=True)
-            print (f'ulysses_pg: {self.ulysses_pg}', flush=True)
-            print (f'ring_pg: {self.ring_pg}', flush=True)
             ring_out = moreh_gpt_attention(
                 self,
                 q_in,
@@ -2063,33 +2055,15 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 causal=True,
                 window_size=(-1, -1),
             )
-            ring_out = ring_out.transpose(1, 2)
-            print (f'ring_out shape: {ring_out.shape}', flush=True)
             
-            # Output is [B, S, H, V_D]. Flatten back to [S, H, V_D] or [S*H*V_D] as needed?
-            # `output` arg is usually [S, H, V_D] or similar?
-            # Check `_run_prefill_new_tokens` return. it returns `attn_output, lse`.
-            # `attn_output` is usually [num_tokens, num_heads, v_head_dim].
-            
-            output_prefill = ring_out.squeeze(0) # [S, H, V]
-            # LSE? moreh_gpt_attention returns (output, lse). Wait, helper returns output.
-            # `moreh_gpt_attention` returns `output`.
-            
-            # If we need LSE, we need to modify moreh_gpt_attention or accept it doesn't return LSE in signature 
-            # provided in `ring_attention.py` snippet (line 659 returns output only).
-            # The user provided `moreh_gpt_attention` implementation returns `output`.
-            # `_run_prefill_new_tokens` returns tuple (output, lse) if return_softmax_lse=True.
-            # Does `has_context` matter for SP?
-            # Usually SP is full prefill. `has_context` (Chunked) shouldn't be active if we do SP Ring?
-            
-            # Assuming we don't need LSE for now or Ring covers it.
-            # Also `output` in `_forward_prefill` ends up with `copy_`.
-            
-            output_prefill = output_prefill.flatten(start_dim=-2) # [S, H*V]
-            print (f'output_prefill shape: {output_prefill.shape}', flush=True)
-            print (f'output shape: {output.shape}', flush=True)
+            ring_out = ring_out.squeeze(0) # [S, H, V]
+
+            if ulysses_size > 1:
+                ring_out = self._ulysses_output_all_to_all(ring_out, bounds, lengths)
+
+            # [S, H, V] -> [S, H*V]
+            output_prefill = ring_out.flatten(start_dim=-2) 
             output.copy_(output_prefill)
-            pass
 
         else:
             output_prefill = self._run_prefill_new_tokens(
