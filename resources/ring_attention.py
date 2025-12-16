@@ -528,11 +528,6 @@ def call_block_attn(
 
     attn = "flash"
 
-    print (f'shape of query: {query.shape}')
-    print (f'shape of key: {key.shape}')
-    print (f'shape of value: {value.shape}')
-    print (f'shape of sinks: {sinks.shape}')
-
     if window_size != (-1, -1):
         attn = "triton"
 
@@ -580,19 +575,8 @@ def moreh_gpt_attention(
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
     assert module.attn_type == AttnType.TORCH
 
-    query = query.transpose(1, 2).contiguous()
-    key = key.transpose(1, 2).contiguous()
-    value = value.transpose(1, 2).contiguous()
-
-    print (f'ulysses pg: {module.ulysses_pg}')
-    print (f'ring pg: {module.ring_pg}')
     ulysses_size = dist.get_world_size(module.ulysses_pg)
     ring_size = dist.get_world_size(module.ring_pg)
-
-    print (f'ulysses size: {ulysses_size}')
-    print (f'ring size: {ring_size}')
-
-    print (f'none pg size: {dist.get_world_size(None)}')
 
     comm = RingComm(module.ring_pg)
 
@@ -636,7 +620,6 @@ def moreh_gpt_attention(
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             with torch.cuda.stream(comm_stream):
-                print (f'next_k shape: {next_k.shape}')
                 comm.commit()
 
         key, value = key_layer, value_layer

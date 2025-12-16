@@ -2018,8 +2018,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         
         sp_size = ring_size * ulysses_size
 
-        print (f'ring_size: {ring_size}, ulysses_size: {ulysses_size}, sp_size: {sp_size}', flush=True)
-
         if sp_size > 1:
             # Ring Attention / SP path
             
@@ -2034,7 +2032,10 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             if ulysses_size > 1:
                 bounds = attn_metadata.prefill.query_start_loc
                 lengths = attn_metadata.prefill.query_seq_lens_cpu
-                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, v_in, bounds, lengths)
+                maybe_padded_v_in = torch.nn.functional.pad(
+                    v_in, [0, q_in.shape[-1] - v_in.shape[-1]], value=0
+                )
+                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds, lengths)
                 
                 ulysses_rank = dist.get_rank(self.ulysses_pg)
                 sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
@@ -2058,16 +2059,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             
             ring_out = ring_out.squeeze(0) # [S, H, V]
 
-            print (f'shape of ring_out before all-to-all: {ring_out.shape}')
             if ulysses_size > 1:
                 ring_out = self._ulysses_output_all_to_all(ring_out, bounds, lengths)
 
-            # [S, H, V] -> [S, H*V]
-            print (f'shape of ring_out: {ring_out.shape}')
-            #output_prefill = ring_out.flatten(start_dim=-2)
-            output_prefill = ring_out.view(output.shape)
-            print (f'shape of output_prefill: {output_prefill.shape}')
-            print (f'shape of output: {output.shape}')
+
+            output_prefill = ring_out[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
 
         else:
@@ -2208,7 +2204,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        print (f'has_prefill: {has_prefill}, has_decode: {has_decode}', flush=True)
         if has_prefill:
             self._forward_prefill(
                 prefill_q,
