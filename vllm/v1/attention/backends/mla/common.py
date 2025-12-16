@@ -2058,11 +2058,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             
             ring_out = ring_out.squeeze(0) # [S, H, V]
 
+            print (f'shape of ring_out before all-to-all: {ring_out.shape}')
             if ulysses_size > 1:
                 ring_out = self._ulysses_output_all_to_all(ring_out, bounds, lengths)
 
             # [S, H, V] -> [S, H*V]
-            output_prefill = ring_out.flatten(start_dim=-2) 
+            print (f'shape of ring_out: {ring_out.shape}')
+            #output_prefill = ring_out.flatten(start_dim=-2)
+            output_prefill = ring_out.view(output.shape)
+            print (f'shape of output_prefill: {output_prefill.shape}')
+            print (f'shape of output: {output.shape}')
             output.copy_(output_prefill)
 
         else:
