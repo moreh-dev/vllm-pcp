@@ -1365,7 +1365,6 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = (
         all_ranks.transpose(5, 6).reshape(-1, tensor_model_parallel_size).unbind(0)
     )
