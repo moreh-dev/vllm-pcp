@@ -857,16 +857,16 @@ class WorkerProc:
             process_name += f"_DP{dp_rank}"
         if pp_size > 1:
             process_name += f"_PP{pp_rank}"
-        if rp_size > 1:
-            process_name += f"_RP{rp_rank}"
-        if up_size > 1:
-            process_name += f"_UP{up_rank}"
         if pcp_size > 1:
             process_name += f"_PCP{pcp_rank}"
+        if rp_size > 1:
+            process_name += f"_RP{rp_rank}"
         if tp_size > 1:
             process_name += f"_TP{tp_rank}"
         if dcp_size > 1:
             process_name += f"_DCP{dcp_rank}"
+        if up_size > 1:
+            process_name += f"_UP{up_rank}"
         if enable_ep:
             ep_rank = get_ep_group().rank_in_group
             process_name += f"_EP{ep_rank}"
