@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_rp_group,
     get_tp_group,
     get_up_group,
     graph_capture,
@@ -309,6 +310,8 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.up_world_size = self.parallel_config.ulysses_parallel_size
         self.up_rank = 0 if self.up_world_size <= 1 else get_up_group().rank_in_group
+        self.rp_world_size = self.parallel_config.ring_parallel_size
+        self.rp_rank = 0 if self.rp_world_size <= 1 else get_rp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
@@ -1304,22 +1307,22 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        orig_num_scheduled_tokens = num_scheduled_tokens.copy()
+        ring_local_lens = orig_num_scheduled_tokens.astype(np.int64)
+        ring_chunk_lens = np.zeros_like(ring_local_lens, dtype=np.int64)
+        if self.rp_world_size > 1:
+            rp_align = 2 * self.rp_world_size
+            ring_chunk_lens = (ring_local_lens + rp_align - 1) // rp_align
+            ring_local_lens = 2 * ring_chunk_lens
+
+        up_chunk_lens = ring_local_lens
         if self.up_world_size > 1:
-            ulysses_orig_num_scheduled_tokens = num_scheduled_tokens.copy()
+            up_chunk_lens = (up_chunk_lens + self.up_world_size - 1) // self.up_world_size
 
-            # Split each request's scheduled tokens across UP ranks.
-            # Each rank r owns the slice [r*chunk, (r+1)*chunk), where
-            # chunk = ceil(L / up_world_size). If not divisible, we pad.
-            chunk_sizes = (
-                (ulysses_orig_num_scheduled_tokens + self.up_world_size - 1)
-                // self.up_world_size
-            ).astype(np.int32)
-            num_scheduled_tokens[:num_reqs] = chunk_sizes[:num_reqs]
-            total_num_scheduled_tokens = int(chunk_sizes[:num_reqs].sum())
+        if self.up_world_size > 1 or self.rp_world_size > 1:
+            num_scheduled_tokens[:num_reqs] = up_chunk_lens.astype(np.int32)[:num_reqs]
+            total_num_scheduled_tokens = int(num_scheduled_tokens[:num_reqs].sum())
             scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
-
-            # Per-request offset within the scheduled segment for this UP rank.
-            ulysses_start_offsets = (chunk_sizes * self.up_rank).astype(np.int64)
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1335,14 +1338,48 @@ class GPUModelRunner(
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
+        scheduled_offsets = arange.astype(np.int64)
+        is_pad = None
+        if self.up_world_size > 1 or self.rp_world_size > 1:
+            up_chunk_lens_repeated = np.repeat(up_chunk_lens[:num_reqs], num_scheduled_tokens)
+            ring_local_indices = up_chunk_lens_repeated * self.up_rank + scheduled_offsets
+
+            if self.rp_world_size > 1:
+                ring_chunk_lens_repeated = np.repeat(
+                    ring_chunk_lens[:num_reqs], num_scheduled_tokens
+                )
+                head_mask = ring_local_indices < ring_chunk_lens_repeated
+
+                head_start = ring_chunk_lens * self.rp_rank
+                tail_start = ring_chunk_lens * (2 * self.rp_world_size - 1 - self.rp_rank)
+                head_start_repeated = np.repeat(head_start[:num_reqs], num_scheduled_tokens)
+                tail_start_repeated = np.repeat(tail_start[:num_reqs], num_scheduled_tokens)
+
+                scheduled_offsets = np.empty_like(ring_local_indices, dtype=np.int64)
+                scheduled_offsets[head_mask] = (
+                    head_start_repeated[head_mask] + ring_local_indices[head_mask]
+                )
+                scheduled_offsets[~head_mask] = tail_start_repeated[~head_mask] + (
+                    ring_local_indices[~head_mask] - ring_chunk_lens_repeated[~head_mask]
+                )
+            else:
+                scheduled_offsets = ring_local_indices
+
+            ring_local_lens_repeated = np.repeat(
+                ring_local_lens[:num_reqs], num_scheduled_tokens
+            )
+            orig_lens_repeated = np.repeat(
+                orig_num_scheduled_tokens[:num_reqs], num_scheduled_tokens
+            )
+            is_pad = (ring_local_indices >= ring_local_lens_repeated) | (
+                scheduled_offsets >= orig_lens_repeated
+            )
+
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
-            arange,
+            scheduled_offsets,
             out=positions_np,
         )
-
-        if self.up_world_size > 1:
-            positions_np += np.repeat(ulysses_start_offsets[:num_reqs], num_scheduled_tokens)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1361,6 +1398,8 @@ class GPUModelRunner(
         token_indices = (
             positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
+        if is_pad is not None:
+            token_indices[is_pad] = 0
         token_indices_tensor = torch.from_numpy(token_indices)
 
         # NOTE(woosuk): We use torch.index_select instead of np.take here
@@ -1420,19 +1459,16 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
+        # Ensure positions passed to slot mapping stay within the block table
+        # bounds even for padded tokens (which are ignored afterwards).
+        if is_pad is not None and is_pad.any():
+            positions_np[is_pad] = 0
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        if self.up_world_size > 1:
-            # Mask out pads introduced by UP splitting and
-            # Ensure padded tokens are ignored by KV cache ops.
-            # (We set slot_mapping=-1 for pads.)
-            offsets_within_scheduled = (
-                np.repeat(ulysses_start_offsets[:num_reqs], num_scheduled_tokens)
-                + arange
+        if is_pad is not None and is_pad.any():
+            positions_np[is_pad] = (
+                self.input_batch.num_computed_tokens_cpu[req_indices[is_pad]]
+                + scheduled_offsets[is_pad]
             )
-            orig_lens_repeated = np.repeat(
-                ulysses_orig_num_scheduled_tokens[:num_reqs], num_scheduled_tokens
-            )
-            is_pad = offsets_within_scheduled >= orig_lens_repeated
 
             self.input_ids.np[:total_num_scheduled_tokens][is_pad] = 0
             if self.enable_prompt_embeds:
@@ -1465,17 +1501,12 @@ class GPUModelRunner(
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
         # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
-        if self.up_world_size > 1:
-            # Global (unpadded) seq len after this step, for chunked prefill logic.
-            self.discard_request_mask.np[:num_reqs] = (
-                self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                + ulysses_orig_num_scheduled_tokens[:num_reqs]
-            ) < num_tokens_np
-        else:
-            self.discard_request_mask.np[:num_reqs] = (
-                self.seq_lens.np[:num_reqs] < num_tokens_np
-            )
+        # so that we could clear the sampled tokens before returning.
+        # Use the global (unpadded) scheduled length for chunked prefill logic.
+        self.discard_request_mask.np[:num_reqs] = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + orig_num_scheduled_tokens[:num_reqs]
+        ) < num_tokens_np
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Copy the tensors to the GPU.
