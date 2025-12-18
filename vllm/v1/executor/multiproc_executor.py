@@ -36,6 +36,8 @@ from vllm.distributed.parallel_state import (
     get_ep_group,
     get_inner_dp_world_group,
     get_pcp_group,
+    get_rp_group,
+    get_up_group,
     get_pp_group,
     get_tp_group,
 )
@@ -114,11 +116,14 @@ class MultiprocExecutor(Executor):
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
         pcp_size = self.parallel_config.prefill_context_parallel_size
-        assert self.world_size == tp_size * pp_size * pcp_size, (
+        rp_size = self.parallel_config.ring_parallel_size if not self.parallel_config.share_rp_tp_group else 1
+        up_size = self.parallel_config.ulysses_parallel_size
+        assert self.world_size == tp_size * pp_size * pcp_size * rp_size * up_size, (
             f"world_size ({self.world_size}) must be equal to the "
             f"tensor_parallel_size ({tp_size}) x pipeline"
             f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
+            f"_parallel_size ({pcp_size}) x ring_parallel_size ({rp_size}) "
+            f"x ulysses_parallel_size ({up_size}). "
         )
 
         # Set multiprocessing envs
@@ -431,6 +436,8 @@ class MultiprocExecutor(Executor):
             self.world_size
             - self.parallel_config.tensor_parallel_size
             * self.parallel_config.prefill_context_parallel_size
+            * self.parallel_config.ring_parallel_size
+            * self.parallel_config.ulysses_parallel_size
         )
 
 
@@ -835,6 +842,10 @@ class WorkerProc:
         dp_rank = get_dp_group().rank_in_group
         pp_size = get_pp_group().world_size
         pp_rank = get_pp_group().rank_in_group
+        rp_size = get_rp_group().world_size
+        rp_rank = get_rp_group().rank_in_group
+        up_size = get_up_group().world_size
+        up_rank = get_up_group().rank_in_group
         pcp_size = get_pcp_group().world_size
         pcp_rank = get_pcp_group().rank_in_group
         tp_size = get_tp_group().world_size
@@ -848,10 +859,14 @@ class WorkerProc:
             process_name += f"_PP{pp_rank}"
         if pcp_size > 1:
             process_name += f"_PCP{pcp_rank}"
+        if rp_size > 1:
+            process_name += f"_RP{rp_rank}"
         if tp_size > 1:
             process_name += f"_TP{tp_rank}"
         if dcp_size > 1:
             process_name += f"_DCP{dcp_rank}"
+        if up_size > 1:
+            process_name += f"_UP{up_rank}"
         if enable_ep:
             ep_rank = get_ep_group().rank_in_group
             process_name += f"_EP{ep_rank}"
