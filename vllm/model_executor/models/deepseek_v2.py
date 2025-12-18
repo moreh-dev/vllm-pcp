@@ -930,7 +930,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
+        disable_tp = is_rp_tp_group_shared()
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
@@ -963,6 +964,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=disable_tp,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -971,6 +973,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                disable_tp=disable_tp,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -979,6 +982,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=disable_tp,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -986,6 +990,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=disable_tp,
         )
 
         if config.rope_parameters["rope_type"] != "default":
