@@ -1158,6 +1158,13 @@ def graph_capture(device: torch.device):
 
 logger = init_logger(__name__)
 
+_RP_TP_GROUP_SHARED = False
+
+
+def is_rp_tp_group_shared():
+    return _RP_TP_GROUP_SHARED
+
+
 _ENABLE_CUSTOM_ALL_REDUCE = True
 
 
@@ -1328,6 +1335,8 @@ def initialize_model_parallel(
         data_parallel_size = config.parallel_config.data_parallel_size
 
     if share_rp_tp_group:
+        global _RP_TP_GROUP_SHARED
+        _RP_TP_GROUP_SHARED = True
         ring_model_parallel_size = 1
 
     # the layout order is: ExternalDP x DP x PP x TP
