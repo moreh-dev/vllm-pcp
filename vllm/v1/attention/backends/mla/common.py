@@ -246,6 +246,7 @@ try:
         RingComm,
         SeqAllToAll4D,
         moreh_gpt_attention,
+        _moreh_gpt_attention_balanced_full,
     )
 except ImportError:
     pass
@@ -2060,7 +2061,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             v_in = v_in.unsqueeze(0)
 
             # Call Ring Attention
-            ring_out = moreh_gpt_attention(
+            ring_out = _moreh_gpt_attention_balanced_full(
                 self,
                 q_in,
                 k_in,

@@ -513,7 +513,6 @@ def call_block_attn(
     query,
     key,
     value,
-    sinks,
     softmax_scale,
     causal,
     window_size,
@@ -637,7 +636,6 @@ def moreh_gpt_attention(
                 query_layer,
                 key,
                 value,
-                sinks,
                 softmax_scale,
                 causal and step == 0,
                 adjusted_window_size,
@@ -864,12 +862,6 @@ def _moreh_gpt_attention_balanced_full(
     assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
     assert causal is True, "Balanced Ring Attention requires causal=True."
 
-    query = query.transpose(1, 2).contiguous()
-    key = key.transpose(1, 2).contiguous()
-    value = value.transpose(1, 2).contiguous()
-
-    ulysses_size = dist.get_world_size(module.ulysses_pg)
-
     comm = RingComm(module.ring_pg)
 
     global _WARMUPED
@@ -884,16 +876,9 @@ def _moreh_gpt_attention_balanced_full(
         received_tensor += 1.0
         _WARMUPED = True
 
-    if ulysses_size > 1:
-        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
-        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
-        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
-        ulysses_rank = dist.get_rank(module.ulysses_pg)
-        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
-    else:
-        query_layer = query
-        key_layer = key
-        value_layer = value
+    query_layer = query
+    key_layer = key
+    value_layer = value
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
@@ -921,7 +906,6 @@ def _moreh_gpt_attention_balanced_full(
                 query_layer,
                 key,
                 value,
-                sinks,
                 softmax_scale,
                 causal,
                 window_size,
@@ -937,7 +921,6 @@ def _moreh_gpt_attention_balanced_full(
                     query_layer,
                     key0,
                     value0,
-                    sinks,
                     softmax_scale,
                     False,
                     window_size,
@@ -949,7 +932,6 @@ def _moreh_gpt_attention_balanced_full(
                 query1,
                 key,
                 value,
-                sinks,
                 softmax_scale,
                 False,
                 window_size,
@@ -968,10 +950,7 @@ def _moreh_gpt_attention_balanced_full(
             value_layer = next_v
 
     out = out.to(query.dtype)
-    if dist.get_world_size(module.ulysses_pg) > 1:
-        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
-    else:
-        output = out
+    output = out
 
     return output
 
