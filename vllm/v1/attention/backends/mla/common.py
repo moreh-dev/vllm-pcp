@@ -1454,7 +1454,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             output_list.append(output.narrow(0, bounds[i], lengths[i]))
 
         output_out_list = []
-
         for i in range(num_reqs):
             # [seq, heads/up_size, dim] -> [up_size, seq/up_size, heads/up_size, dim]
             output_reshaped = output_list[i].reshape(
@@ -2041,12 +2040,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             sinks.fill_(float('-inf'))
 
             if ulysses_size > 1:
-                bounds = attn_metadata.prefill.query_start_loc
-                lengths = attn_metadata.prefill.query_seq_lens_cpu
+                lengths_local = [int(x) for x in attn_metadata.prefill.query_seq_lens_cpu.tolist()]
+                bounds_local = [0]
+                for length in lengths_local:
+                    bounds_local.append(bounds_local[-1] + length)
+
                 maybe_padded_v_in = torch.nn.functional.pad(
                     v_in, [0, q_in.shape[-1] - v_in.shape[-1]], value=0
                 )
-                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds, lengths)
+
+                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds_local, lengths_local)
                 
                 ulysses_rank = dist.get_rank(self.ulysses_pg)
                 sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
@@ -2071,8 +2074,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             ring_out = ring_out.squeeze(0) # [S, H, V]
 
             if ulysses_size > 1:
-                ring_out = self._ulysses_output_all_to_all(ring_out, bounds, lengths)
-
+                bounds_global = [b * self.up_world_size for b in bounds_local]
+                lengths_global = [l * self.up_world_size for l in lengths_local]
+                ring_out = self._ulysses_output_all_to_all(ring_out, bounds_global, lengths_global)
 
             output_prefill = ring_out[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
