@@ -1366,8 +1366,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         Args:
             q, k, v: [seq/up_size, heads, dim]
-            bounds: query_start_loc (GPU tensor, cumulative positions)
-            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+            bounds: per-request (local) cumulative positions of qkv
+            lengths: per-request (local) sequence lengths of qkv
 
         Returns:
             q, k, v: [seq, heads/up_size, dim]
@@ -1433,8 +1433,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         Args:
             output: [seq, heads/up_size, dim]
-            bounds: query_start_loc (GPU tensor, cumulative positions)
-            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+            bounds: per-request (global) cumulative positions of output
+            lengths: per-request (global) sequence lengths of output
 
         Returns:
             output: [seq/up_size, heads, dim]
@@ -1451,7 +1451,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         # Split into per-request chunks
         output_list = []
         for i in range(num_reqs):
-            output_list.append(output.narrow(0, bounds[i], lengths[i] * self.up_world_size))
+            output_list.append(output.narrow(0, bounds[i], lengths[i]))
 
         output_out_list = []
 
@@ -1506,12 +1506,21 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             kwargs["num_splits"] = 1
 
         if self.up_world_size > 1 and query_seq_lens_cpu is not None:
-            bounds = kwargs['cu_seqlens_q']
-            q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(q, k, maybe_padded_v, bounds, query_seq_lens_cpu)
-            kwargs['cu_seqlens_q'] = kwargs['cu_seqlens_q'] * self.up_world_size
-            kwargs['cu_seqlens_k'] = kwargs['cu_seqlens_k'] * self.up_world_size
-            kwargs['max_seqlen_q'] = kwargs['max_seqlen_q'] * self.up_world_size
-            kwargs['max_seqlen_k'] = kwargs['max_seqlen_k'] * self.up_world_size
+            # NOTE: Avoid GPU scalar sync for slicing by reconstructing bounds from
+            # per-request lengths on CPU instead of using cu_seqlens_q.
+            lengths_local = [int(x) for x in query_seq_lens_cpu.tolist()]
+            bounds_local = [0]
+            for length in lengths_local:
+                bounds_local.append(bounds_local[-1] + length)
+
+            q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(
+                q, k, maybe_padded_v, bounds_local, lengths_local
+            )
+
+            kwargs["cu_seqlens_q"] = kwargs["cu_seqlens_q"] * self.up_world_size
+            kwargs["cu_seqlens_k"] = kwargs["cu_seqlens_k"] * self.up_world_size
+            kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"] * self.up_world_size
+            kwargs["max_seqlen_k"] = kwargs["max_seqlen_k"] * self.up_world_size
 
         attn_out = self.flash_attn_varlen_func(
             q=q,
@@ -1527,7 +1536,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             attn_out, lse = attn_out[0], attn_out[1]
 
         if self.up_world_size > 1 and query_seq_lens_cpu is not None:
-            attn_out = self._ulysses_output_all_to_all(attn_out, bounds, query_seq_lens_cpu)
+            bounds_global = [b * self.up_world_size for b in bounds_local]
+            lengths_global = [l * self.up_world_size for l in lengths_local]
+            attn_out = self._ulysses_output_all_to_all(attn_out, bounds_global, lengths_global)
 
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
