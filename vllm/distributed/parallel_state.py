@@ -1343,16 +1343,31 @@ def initialize_model_parallel(
         -1,
         data_parallel_size,
         pipeline_model_parallel_size,
-        ulysses_model_parallel_size,
-        ring_model_parallel_size,
         prefill_context_model_parallel_size,
+        ring_model_parallel_size,
         tensor_model_parallel_size,
+        ulysses_model_parallel_size,
     )  # noqa
+
+    # Build the ulysses model-parallel groups.
+    global _UP
+    assert _UP is None, "ulysses model parallel group is already initialized"
+    group_ranks = all_ranks.view(-1, ulysses_model_parallel_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    _UP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="up",
+    )
 
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+    group_ranks = (
+        all_ranks.transpose(5, 6).reshape(-1, tensor_model_parallel_size).unbind(0)
+    )
     group_ranks = [x.tolist() for x in group_ranks]
 
     # message queue broadcaster is only used in tensor model parallel group
@@ -1382,21 +1397,6 @@ def initialize_model_parallel(
             group_name="rp",
         )
 
-    # Build the ulysses model-parallel groups.
-    global _UP
-    assert _UP is None, "ulysses model parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(3, 6).reshape(-1, ulysses_model_parallel_size).unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _UP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=True,
-        group_name="up",
-    )
-
     # Build the DCP model-parallel groups.
     global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
@@ -1417,7 +1417,7 @@ def initialize_model_parallel(
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(5, 6)
+        all_ranks.transpose(3, 6)
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
     )
@@ -1448,12 +1448,14 @@ def initialize_model_parallel(
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
     group_ranks = (
-        all_ranks.permute(0, 2, 3, 4, 1, 5, 6)
+        all_ranks.permute(0, 2, 1, 3, 4, 5, 6)
         .reshape(
             -1,
             data_parallel_size
             * prefill_context_model_parallel_size
-            * tensor_model_parallel_size,
+            * ring_model_parallel_size
+            * tensor_model_parallel_size
+            * ulysses_model_parallel_size,
         )
         .unbind(0)
     )
@@ -1464,16 +1466,16 @@ def initialize_model_parallel(
 
     logger.info_once(
         "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, UP rank %s, RP rank %s, PCP rank %s, "
-        "TP rank %s, EP rank %s",
+        "DP rank %s, PP rank %s, PCP rank %s, "
+        "RP rank %s, TP rank %s, UP rank %s, EP rank %s",
         rank,
         world_size,
         _DP.rank_in_group,
         _PP.rank_in_group,
-        _UP.rank_in_group,
-        _RP.rank_in_group,
         _PCP.rank_in_group,
+        _RP.rank_in_group,
         _TP.rank_in_group,
+        _UP.rank_in_group,
         _EP.rank_in_group,
     )
 
@@ -1544,14 +1546,14 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
     MoE all2all (DeepEP) usually allocate the communication buffer
     based on the model shape for optimal performance.
     """
-    if _TP is not None:
-        _TP.prepare_communication_buffer_for_model(model)
-    if _PCP is not None:
-        _PCP.prepare_communication_buffer_for_model(model)
-    if _RP is not None:
-        _RP.prepare_communication_buffer_for_model(model)
     if _UP is not None:
         _UP.prepare_communication_buffer_for_model(model)
+    if _TP is not None:
+        _TP.prepare_communication_buffer_for_model(model)
+    if _RP is not None:
+        _RP.prepare_communication_buffer_for_model(model)
+    if _PCP is not None:
+        _PCP.prepare_communication_buffer_for_model(model)
     if _PP is not None:
         _PP.prepare_communication_buffer_for_model(model)
     if _DP is not None:
@@ -1621,8 +1623,12 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _UP
+    if _UP:
+        _UP.destroy()
+    _UP = None
 
+    global _TP
     if _TP:
         _TP.destroy()
     _TP = None
@@ -1632,20 +1638,15 @@ def destroy_model_parallel():
         _DCP.destroy()
     _DCP = None
 
-    global _PCP
-    if _PCP:
-        _PCP.destroy()
-    _PCP = None
-
     global _RP
     if _RP:
         _RP.destroy()
     _RP = None
 
-    global _UP
-    if _UP:
-        _UP.destroy()
-    _UP = None
+    global _PCP
+    if _PCP:
+        _PCP.destroy()
+    _PCP = None
 
     global _PP
     if _PP:
