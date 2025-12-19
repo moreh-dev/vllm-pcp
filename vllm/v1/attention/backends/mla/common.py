@@ -210,7 +210,12 @@ from vllm.attention.ops.common import cp_lse_ag_out_rs
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_dcp_group, get_up_group, is_global_first_rank
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_rp_group,
+    get_up_group,
+    is_global_first_rank,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -232,6 +237,19 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+try:
+    from yunchang.globals import PROCESS_GROUP
+
+    from resources.ring_attention import (
+        AttnType,
+        RingComm,
+        SeqAllToAll4D,
+        moreh_gpt_attention,
+        _moreh_gpt_attention_balanced_full,
+    )
+except ImportError:
+    pass
 
 
 class QueryLenSupport(Enum):
@@ -546,6 +564,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
             self.up_world_size = get_up_group().world_size
+            self.rp_world_size = get_rp_group().world_size
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
@@ -1322,6 +1341,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self.dcp_world_size: int | None = None
         self.up_world_size: int | None = None
 
+        # Ring Attention / Sequence Parallelism Setup
+        self.ring_pg = get_rp_group().device_group
+        self.ulysses_pg = get_up_group().device_group
+        # Use simple default indices for Ulysses: Scatter Heads (2), Gather Seq (1)
+        self.scatter_idx = 2
+        self.gather_idx = 1
+        self.use_pack_qkv = False
+        if "AttnType" in globals():
+            self.attn_type = AttnType.TORCH
+        
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
@@ -1338,8 +1367,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         Args:
             q, k, v: [seq/up_size, heads, dim]
-            bounds: query_start_loc (GPU tensor, cumulative positions)
-            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+            bounds: per-request (local) cumulative positions of qkv
+            lengths: per-request (local) sequence lengths of qkv
 
         Returns:
             q, k, v: [seq, heads/up_size, dim]
@@ -1405,8 +1434,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         Args:
             output: [seq, heads/up_size, dim]
-            bounds: query_start_loc (GPU tensor, cumulative positions)
-            lengths: query_seq_lens_cpu (CPU tensor, per-request lengths)
+            bounds: per-request (global) cumulative positions of output
+            lengths: per-request (global) sequence lengths of output
 
         Returns:
             output: [seq/up_size, heads, dim]
@@ -1423,10 +1452,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         # Split into per-request chunks
         output_list = []
         for i in range(num_reqs):
-            output_list.append(output.narrow(0, bounds[i], lengths[i] * self.up_world_size))
+            output_list.append(output.narrow(0, bounds[i], lengths[i]))
 
         output_out_list = []
-
         for i in range(num_reqs):
             # [seq, heads/up_size, dim] -> [up_size, seq/up_size, heads/up_size, dim]
             output_reshaped = output_list[i].reshape(
@@ -1478,12 +1506,21 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             kwargs["num_splits"] = 1
 
         if self.up_world_size > 1 and query_seq_lens_cpu is not None:
-            bounds = kwargs['cu_seqlens_q']
-            q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(q, k, maybe_padded_v, bounds, query_seq_lens_cpu)
-            kwargs['cu_seqlens_q'] = kwargs['cu_seqlens_q'] * self.up_world_size
-            kwargs['cu_seqlens_k'] = kwargs['cu_seqlens_k'] * self.up_world_size
-            kwargs['max_seqlen_q'] = kwargs['max_seqlen_q'] * self.up_world_size
-            kwargs['max_seqlen_k'] = kwargs['max_seqlen_k'] * self.up_world_size
+            # NOTE: Avoid GPU scalar sync for slicing by reconstructing bounds from
+            # per-request lengths on CPU instead of using cu_seqlens_q.
+            lengths_local = [int(x) for x in query_seq_lens_cpu.tolist()]
+            bounds_local = [0]
+            for length in lengths_local:
+                bounds_local.append(bounds_local[-1] + length)
+
+            q, k, maybe_padded_v = self._ulysses_qkv_all_to_all(
+                q, k, maybe_padded_v, bounds_local, lengths_local
+            )
+
+            kwargs["cu_seqlens_q"] = kwargs["cu_seqlens_q"] * self.up_world_size
+            kwargs["cu_seqlens_k"] = kwargs["cu_seqlens_k"] * self.up_world_size
+            kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"] * self.up_world_size
+            kwargs["max_seqlen_k"] = kwargs["max_seqlen_k"] * self.up_world_size
 
         attn_out = self.flash_attn_varlen_func(
             q=q,
@@ -1499,7 +1536,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             attn_out, lse = attn_out[0], attn_out[1]
 
         if self.up_world_size > 1 and query_seq_lens_cpu is not None:
-            attn_out = self._ulysses_output_all_to_all(attn_out, bounds, query_seq_lens_cpu)
+            bounds_global = [b * self.up_world_size for b in bounds_local]
+            lengths_global = [l * self.up_world_size for l in lengths_local]
+            attn_out = self._ulysses_output_all_to_all(attn_out, bounds_global, lengths_global)
 
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
@@ -1984,47 +2023,107 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
-        output_prefill = self._run_prefill_new_tokens(
-            prefill=attn_metadata.prefill,
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-        )
+        ring_size = get_rp_group().world_size
 
-        if has_context:
-            suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
-                context_output, context_lse = (
-                    self._context_parallel_compute_prefill_context(
-                        q,
-                        kv_c_and_k_pe_cache,
-                        attn_metadata,
-                        k_scale=None,
-                        dcp_world_size=self.dcp_world_size,
+        ulysses_size = get_up_group().world_size
+        
+        sp_size = ring_size * ulysses_size
+
+        if sp_size > 1:
+            # Ring Attention / SP path
+            
+            q_in = q
+            k_in = k
+            v_in = v
+            
+            # Sinks are dummy for now?
+            sinks = torch.zeros(self.num_heads, dtype=q.dtype, device=q.device)
+            sinks.fill_(float('-inf'))
+
+            if ulysses_size > 1:
+                lengths_local = [int(x) for x in attn_metadata.prefill.query_seq_lens_cpu.tolist()]
+                bounds_local = [0]
+                for length in lengths_local:
+                    bounds_local.append(bounds_local[-1] + length)
+
+                maybe_padded_v_in = torch.nn.functional.pad(
+                    v_in, [0, q_in.shape[-1] - v_in.shape[-1]], value=0
+                )
+
+                q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds_local, lengths_local)
+                
+                ulysses_rank = dist.get_rank(self.ulysses_pg)
+                sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+            
+            # Reshape to [B, S, H, D]. Assuming B=1 for this context.
+            q_in = q_in.unsqueeze(0)
+            k_in = k_in.unsqueeze(0)
+            v_in = v_in.unsqueeze(0)
+
+            # Call Ring Attention
+            ring_out = _moreh_gpt_attention_balanced_full(
+                self,
+                q_in,
+                k_in,
+                v_in,
+                sinks,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=(-1, -1),
+            )
+            
+            ring_out = ring_out.squeeze(0) # [S, H, V]
+
+            if ulysses_size > 1:
+                bounds_global = [b * self.up_world_size for b in bounds_local]
+                lengths_global = [l * self.up_world_size for l in lengths_local]
+                ring_out = self._ulysses_output_all_to_all(ring_out, bounds_global, lengths_global)
+
+            output_prefill = ring_out[..., : v.shape[-1]].flatten(start_dim=-2)
+            output.copy_(output_prefill)
+
+        else:
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=attn_metadata.prefill,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+            )
+
+            if has_context:
+                suffix_output, suffix_lse = output_prefill
+                if self.dcp_world_size > 1:
+                    context_output, context_lse = (
+                        self._context_parallel_compute_prefill_context(
+                            q,
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                            k_scale=None,
+                            dcp_world_size=self.dcp_world_size,
+                        )
                     )
+                else:
+                    context_output, context_lse = self._compute_prefill_context(
+                        q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                    )
+
+                # unpad if necessary
+                if self._pad_v:
+                    context_output = context_output[..., : v.shape[-1]]
+                    suffix_output = suffix_output[..., : v.shape[-1]]
+
+                output = output.view(-1, self.num_heads, self.v_head_dim)
+                merge_attn_states(
+                    output=output,
+                    prefix_output=context_output,
+                    prefix_lse=context_lse,
+                    suffix_output=suffix_output,
+                    suffix_lse=suffix_lse,
                 )
             else:
-                context_output, context_lse = self._compute_prefill_context(
-                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale
-                )
-
-            # unpad if necessary
-            if self._pad_v:
-                context_output = context_output[..., : v.shape[-1]]
-                suffix_output = suffix_output[..., : v.shape[-1]]
-
-            output = output.view(-1, self.num_heads, self.v_head_dim)
-            merge_attn_states(
-                output=output,
-                prefix_output=context_output,
-                prefix_lse=context_lse,
-                suffix_output=suffix_output,
-                suffix_lse=suffix_lse,
-            )
-        else:
-            output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
-            output.copy_(output_prefill)
+                output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
+                output.copy_(output_prefill)
 
     @abstractmethod
     def _forward_decode(
