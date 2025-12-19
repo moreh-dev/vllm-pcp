@@ -1468,6 +1468,8 @@ class EngineArgs:
                 self.data_parallel_size
                 * self.pipeline_parallel_size
                 * self.tensor_parallel_size
+                * self.ring_parallel_size
+                * self.ulysses_parallel_size
             )
             world_size_within_dp = (
                 self.pipeline_parallel_size * self.tensor_parallel_size
@@ -1494,6 +1496,7 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+                self.data_parallel_size_local = 1
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
