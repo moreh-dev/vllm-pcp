@@ -238,18 +238,17 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-try:
-    from yunchang.globals import PROCESS_GROUP
 
-    from resources.ring_attention import (
-        AttnType,
-        RingComm,
-        SeqAllToAll4D,
-        moreh_gpt_attention,
-        _moreh_gpt_attention_balanced_full,
-    )
-except ImportError:
-    pass
+from yunchang.globals import PROCESS_GROUP
+
+from resources.ring_attention import (
+    AttnType,
+    RingComm,
+    SeqAllToAll4D,
+    moreh_gpt_attention,
+    _moreh_gpt_attention_balanced_full,
+)
+
 
 
 class QueryLenSupport(Enum):
