@@ -1468,7 +1468,7 @@ class EngineArgs:
                 self.data_parallel_size
                 * self.pipeline_parallel_size
                 * self.tensor_parallel_size
-                * self.ring_parallel_size
+                * (self.ring_parallel_size if not self.share_rp_tp_group else 1)
                 * self.ulysses_parallel_size
             )
             world_size_within_dp = (
