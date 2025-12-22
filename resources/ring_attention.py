@@ -261,11 +261,7 @@ def moreh_gpt_attention(
     comm_stream = _get_ring_comm_stream()
 
     for step in range(comm.world_size):
-        current_is_early_stop = window_size[0] != -1 and step == 2
-        next_is_early_stop = window_size[0] != -1 and step == 1
-        if current_is_early_stop:
-            break
-        if step + 1 != comm.world_size and not next_is_early_stop:
+        if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             with torch.cuda.stream(comm_stream):
@@ -293,7 +289,7 @@ def moreh_gpt_attention(
 
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
-        if step + 1 != comm.world_size and not next_is_early_stop:
+        if step + 1 != comm.world_size:
             comm.wait()
             key_layer = next_k
             value_layer = next_v
@@ -413,35 +409,3 @@ def _moreh_gpt_attention_balanced_full(
     output = out
 
     return output
-
-
-    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
-    assert module.attn_type == AttnType.TORCH
-    assert window_size[1] == -1, "Balanced Ring Attention currently only supports left windowing."
-    assert causal is True, "Balanced Ring Attention requires causal=True."
-
-    if window_size[0] == -1:
-        return _moreh_gpt_attention_balanced_full(
-            module,
-            query,
-            key,
-            value,
-            sinks,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            is_kernel_bhsd=is_kernel_bhsd,
-        )
-    else:
-        return _moreh_gpt_attention_balanced_window(
-            module,
-            query,
-            key,
-            value,
-            sinks,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            is_kernel_bhsd=is_kernel_bhsd,
-        )
