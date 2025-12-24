@@ -41,9 +41,12 @@ from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vll
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_rp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    is_rp_tp_group_shared,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -379,11 +382,10 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
+        elif self.tp_size > 1 and not is_rp_tp_group_shared():
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states
             )
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -928,7 +930,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
+        disable_tp = is_rp_tp_group_shared()
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
@@ -961,6 +964,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=disable_tp,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -969,6 +973,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                disable_tp=disable_tp,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -977,6 +982,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=disable_tp,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -984,6 +990,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=disable_tp,
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -1142,6 +1149,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not is_rp_tp_group_shared(),
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1182,7 +1190,30 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        local_num_tokens = None
+        tp_size = get_tensor_model_parallel_world_size()
+        if is_rp_tp_group_shared() and tp_size > 1:
+            # hidden_states is sharded across RP ranks (DualChunkSwap). To run TP
+            # MoE/MLP, we replicate tokens across the shared (TP==RP) group.
+            local_num_tokens = hidden_states.shape[0]
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
         hidden_states = self.mlp(hidden_states)
+
+        if is_rp_tp_group_shared() and tp_size > 1:
+            assert local_num_tokens is not None
+            if (
+                isinstance(self.mlp, DeepseekV2MoE)
+                and self.mlp.experts.must_reduce_shared_expert_outputs()
+            ):
+                # Some MoE kernels reduce across TP ranks internally. In that
+                # case, only restore the original RP shard without reducing.
+                tp_rank = get_tensor_model_parallel_rank()
+                start = tp_rank * local_num_tokens
+                end = start + local_num_tokens
+                hidden_states = hidden_states[start:end]
+            else:
+                # Reduce TP partial outputs and restore the original RP shard.
+                hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, dim=0)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

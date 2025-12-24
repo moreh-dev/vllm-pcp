@@ -432,11 +432,16 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        rp_size = (
+            1
+            if self.parallel_config.share_rp_tp_group
+            else self.parallel_config.ring_parallel_size
+        )
         return (
             self.world_size
             - self.parallel_config.tensor_parallel_size
             * self.parallel_config.prefill_context_parallel_size
-            * self.parallel_config.ring_parallel_size
+            * rp_size
             * self.parallel_config.ulysses_parallel_size
         )
 

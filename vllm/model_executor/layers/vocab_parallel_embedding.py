@@ -12,6 +12,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    is_rp_tp_group_shared,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.custom_op import CustomOp
@@ -234,8 +235,11 @@ class VocabParallelEmbedding(CustomOp):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = 0
+        self.tp_size = 1
+        if not is_rp_tp_group_shared():
+            tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -476,8 +480,10 @@ class VocabParallelEmbedding(CustomOp):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+            # Reduce across all the model parallel GPUs.
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
         return output
 
     def forward_cuda(self, input_):
