@@ -222,7 +222,6 @@ def moreh_gpt_attention(
     is_kernel_bhsd: bool = True,
 ) -> torch.Tensor:
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
-    assert module.attn_type == AttnType.TORCH
 
     ulysses_size = dist.get_world_size(module.ulysses_pg)
     ring_size = dist.get_world_size(module.ring_pg)
@@ -314,7 +313,6 @@ def _moreh_gpt_attention_balanced_full(
     is_kernel_bhsd: bool = True,
 ) -> torch.Tensor:
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
-    assert module.attn_type == AttnType.TORCH
     assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
     assert causal is True, "Balanced Ring Attention requires causal=True."
 

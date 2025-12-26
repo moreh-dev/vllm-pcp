@@ -1347,8 +1347,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self.scatter_idx = 2
         self.gather_idx = 1
         self.use_pack_qkv = False
-        if "AttnType" in globals():
-            self.attn_type = AttnType.TORCH
         
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
