@@ -247,7 +247,167 @@ from resources.ring_attention import (
     SeqAllToAll4D,
     moreh_gpt_attention,
     _moreh_gpt_attention_balanced_full,
+    _moreh_mla_ring_attention_balanced_full,
 )
+
+
+class QueryLenSupport(Enum):
+# ... (Lines between imports and _forward_prefill are skipped here)
+
+    def _forward_prefill(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # TODO (zyongye): Prefill function here
+        assert attn_metadata.prefill is not None
+        assert self.dcp_world_size is not None
+
+        ring_size = get_rp_group().world_size
+        ulysses_size = get_up_group().world_size
+        sp_size = ring_size * ulysses_size
+
+        # Optimize Ring Attention by using compressed KV if possible
+        # Currently only supported when Ulysses is not used (pure Ring / CP)
+        use_compressed_ring = (sp_size > 1) and (ulysses_size == 1)
+
+        k = None
+        v = None
+
+        if not use_compressed_ring:
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+        has_context = attn_metadata.prefill.chunked_context is not None
+
+        if sp_size > 1:
+            # Ring Attention / SP path
+            
+            q_in = q
+            
+            # Sinks are dummy for now?
+            sinks = torch.zeros(self.num_heads, dtype=q.dtype, device=q.device)
+            sinks.fill_(float('-inf'))
+
+            if use_compressed_ring:
+                 q_in = q_in.unsqueeze(0)
+                 kv_c_normed_in = kv_c_normed.unsqueeze(0)
+                 k_pe_in = k_pe.unsqueeze(0)
+                 
+                 # Call Compressed Ring Attention
+                 ring_out = _moreh_mla_ring_attention_balanced_full(
+                    self,
+                    q_in,
+                    kv_c_normed_in,
+                    k_pe_in,
+                    sinks,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(-1, -1),
+                )
+                 ring_out = ring_out.squeeze(0) # [S, H, V]
+                 # We need to construct v shape for final flattening if needed, or just use hardcoded
+                 # output_prefill = ring_out[..., : self.v_head_dim].flatten(start_dim=-2)
+                 output_prefill = ring_out.flatten(start_dim=-2)
+                 output.copy_(output_prefill)
+
+            else:
+                k_in = k
+                v_in = v
+
+                if ulysses_size > 1:
+                    lengths_local = [int(x) for x in attn_metadata.prefill.query_seq_lens_cpu.tolist()]
+                    bounds_local = [0]
+                    for length in lengths_local:
+                        bounds_local.append(bounds_local[-1] + length)
+
+                    maybe_padded_v_in = torch.nn.functional.pad(
+                        v_in, [0, q_in.shape[-1] - v_in.shape[-1]], value=0
+                    )
+
+                    q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds_local, lengths_local)
+                    
+                    ulysses_rank = dist.get_rank(self.ulysses_pg)
+                    sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+                
+                # Reshape to [B, S, H, D]. Assuming B=1 for this context.
+                q_in = q_in.unsqueeze(0)
+                k_in = k_in.unsqueeze(0)
+                v_in = v_in.unsqueeze(0)
+
+                # Call Ring Attention
+                ring_out = _moreh_gpt_attention_balanced_full(
+                    self,
+                    q_in,
+                    k_in,
+                    v_in,
+                    sinks,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(-1, -1),
+                )
+                
+                ring_out = ring_out.squeeze(0) # [S, H, V]
+
+                if ulysses_size > 1:
+                    bounds_global = [b * self.up_world_size for b in bounds_local]
+                    lengths_global = [l * self.up_world_size for l in lengths_local]
+                    ring_out = self._ulysses_output_all_to_all(ring_out, bounds_global, lengths_global)
+
+                output_prefill = ring_out[..., : v.shape[-1]].flatten(start_dim=-2)
+                output.copy_(output_prefill)
+
+        else:
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=attn_metadata.prefill,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+            )
+
+            if has_context:
+                suffix_output, suffix_lse = output_prefill
+                if self.dcp_world_size > 1:
+                    context_output, context_lse = (
+                        self._context_parallel_compute_prefill_context(
+                            q,
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                            k_scale=None,
+                            dcp_world_size=self.dcp_world_size,
+                        )
+                    )
+                else:
+                    context_output, context_lse = self._compute_prefill_context(
+                        q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                    )
+
+                # unpad if necessary
+                if self._pad_v:
+                    context_output = context_output[..., : v.shape[-1]]
+                    suffix_output = suffix_output[..., : v.shape[-1]]
+
+                output = output.view(-1, self.num_heads, self.v_head_dim)
+                merge_attn_states(
+                    output=output,
+                    prefix_output=context_output,
+                    prefix_lse=context_lse,
+                    suffix_output=suffix_output,
+                    suffix_lse=suffix_lse,
+                )
+            else:
+                output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
+                output.copy_(output_prefill)
 
 
 
