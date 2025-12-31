@@ -247,7 +247,6 @@ from resources.ring_attention import (
     SeqAllToAll4D,
     moreh_gpt_attention,
     _moreh_gpt_attention_balanced_full,
-    _moreh_mla_ring_attention_balanced_full,
 )
 
 
@@ -2022,6 +2021,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         # Optimize Ring Attention by using compressed KV if possible
         # Currently only supported when Ulysses is not used (pure Ring / CP)
+        # OPTIMIZATION 3: Matrix Absorption
         use_compressed_ring = (sp_size > 1) and (ulysses_size == 1)
 
         k = None
@@ -2047,25 +2047,77 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             sinks.fill_(float('-inf'))
 
             if use_compressed_ring:
-                 q_in = q_in.unsqueeze(0)
-                 kv_c_normed_in = kv_c_normed.unsqueeze(0)
-                 k_pe_in = k_pe.unsqueeze(0)
+                 # Matrix Absorption Strategy:
+                 # Standard: Attention(Q_nope, KV_c @ W_UK)
+                 # Absorbed: Attention(Q_nope @ W_UK^T, KV_c)
                  
-                 # Call Compressed Ring Attention
-                 ring_out = _moreh_mla_ring_attention_balanced_full(
+                 # 1. Extract W_UK and W_UV
+                 # kv_b_proj weight is [Out, In] -> [N(P+V), Lkv]
+                 # We need W_UK^T [N, P, Lkv] and W_UV [N, V, Lkv] (Transposed for final proj?)
+                 # Using the logic from process_weights_after_loading/kv_b_proj structure:
+                 w_pack = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+                 
+                 w_uk_t = w_pack[:, :self.qk_nope_head_dim, :] # [N, P, Lkv]
+                 w_uv_t = w_pack[:, self.qk_nope_head_dim:, :] # [N, V, Lkv]
+                 
+                 # 2. Absorb W_UK into Q_nope
+                 # q_in is [Batch=1, S, N, P+R] (assuming it contains q_nope + q_pe concatenated?)
+                 # No, 'q' input to this function.
+                 # Let's check call site.
+                 # q is [1, S, N, P+R] (since it's prefill). No, q is [S, N, P+R] usually.
+                 # Inside _forward_prefill q signature: q: torch.Tensor
+                 # Code "q_nope, q_pe = ...".
+                 # The 'q' tensor comes from `forward`: `q = torch.cat([q_nope, q_pe], dim=-1)`
+                 
+                 q_nope = q_in[..., :self.qk_nope_head_dim] # [S, N, P]
+                 q_pe_in = q_in[..., self.qk_nope_head_dim:] # [S, N, R]
+                 
+                 # Compute Q_abs = Q_nope @ W_UK
+                 # [S, N, P] @ [N, P, Lkv] -> [S, N, Lkv]
+                 # Einsum: 'snp,npl->snl'
+                 q_abs = torch.einsum('snp,npl->snl', q_nope, w_uk_t)
+                 
+                 # Concatenate Q_abs and Q_pe
+                 # Q_ring = [Q_abs, Q_pe] -> [S, N, Lkv + R]
+                 q_ring = torch.cat([q_abs, q_pe_in], dim=-1)
+                 
+                 # 3. Construct K_ring and V_ring
+                 # K_ring = [KV_c, k_pe] -> [S, 1, Lkv + R]
+                 # V_ring = KV_c -> [S, 1, Lkv]
+                 
+                 # Input kv_c_normed is [S, Lkv].
+                 # k_pe is [S, 1, R] (usually).
+                 kv_c_local = kv_c_normed.unsqueeze(1) # [S, 1, Lkv]
+                 
+                 k_ring = torch.cat([kv_c_local, k_pe], dim=-1)
+                 v_ring = kv_c_local
+                 
+                 # Reshape for ring function (expects [B, S, ...])
+                 q_ring = q_ring.unsqueeze(0)
+                 k_ring = k_ring.unsqueeze(0)
+                 v_ring = v_ring.unsqueeze(0)
+                 
+                 # 4. Call Standard Ring Attention
+                 # Output will be [B, S, N, Lkv] (since V_ring dim is Lkv)
+                 ring_out = _moreh_gpt_attention_balanced_full(
                     self,
-                    q_in,
-                    kv_c_normed_in,
-                    k_pe_in,
+                    q_ring,
+                    k_ring,
+                    v_ring,
                     sinks,
                     softmax_scale=self.scale,
                     causal=True,
                     window_size=(-1, -1),
                 )
-                 ring_out = ring_out.squeeze(0) # [S, H, V]
-                 # We need to construct v shape for final flattening if needed, or just use hardcoded
-                 # output_prefill = ring_out[..., : self.v_head_dim].flatten(start_dim=-2)
-                 output_prefill = ring_out.flatten(start_dim=-2)
+                 ring_out = ring_out.squeeze(0) # [S, N, Lkv]
+                 
+                 # 5. Project Output using W_UV
+                 # ring_out [S, N, Lkv] @ W_UV [N, V, Lkv]^T
+                 # w_uv_t is [N, V, Lkv]. We want to project Lkv -> V.
+                 # Einsum: 'snl,nvl->snv'
+                 final_out = torch.einsum('snl,nvl->snv', ring_out, w_uv_t)
+                 
+                 output_prefill = final_out.flatten(start_dim=-2)
                  output.copy_(output_prefill)
 
             else:
