@@ -2053,28 +2053,18 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                  
                  # 1. Extract W_UK and W_UV
                  # kv_b_proj weight is [Out, In] -> [N(P+V), Lkv]
-                 # We need W_UK^T [N, P, Lkv] and W_UV [N, V, Lkv] (Transposed for final proj?)
-                 # Using the logic from process_weights_after_loading/kv_b_proj structure:
                  w_pack = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
                  
                  w_uk_t = w_pack[:, :self.qk_nope_head_dim, :] # [N, P, Lkv]
                  w_uv_t = w_pack[:, self.qk_nope_head_dim:, :] # [N, V, Lkv]
                  
                  # 2. Absorb W_UK into Q_nope
-                 # q_in is [Batch=1, S, N, P+R] (assuming it contains q_nope + q_pe concatenated?)
-                 # No, 'q' input to this function.
-                 # Let's check call site.
-                 # q is [1, S, N, P+R] (since it's prefill). No, q is [S, N, P+R] usually.
-                 # Inside _forward_prefill q signature: q: torch.Tensor
-                 # Code "q_nope, q_pe = ...".
-                 # The 'q' tensor comes from `forward`: `q = torch.cat([q_nope, q_pe], dim=-1)`
-                 
+                 # q [S, N, P+R] -> q_nope [S, N, P], q_pe [S, N, R]
                  q_nope = q_in[..., :self.qk_nope_head_dim] # [S, N, P]
                  q_pe_in = q_in[..., self.qk_nope_head_dim:] # [S, N, R]
                  
                  # Compute Q_abs = Q_nope @ W_UK
                  # [S, N, P] @ [N, P, Lkv] -> [S, N, Lkv]
-                 # Einsum: 'snp,npl->snl'
                  q_abs = torch.einsum('snp,npl->snl', q_nope, w_uk_t)
                  
                  # Concatenate Q_abs and Q_pe
@@ -2084,9 +2074,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                  # 3. Construct K_ring and V_ring
                  # K_ring = [KV_c, k_pe] -> [S, 1, Lkv + R]
                  # V_ring = KV_c -> [S, 1, Lkv]
-                 
-                 # Input kv_c_normed is [S, Lkv].
-                 # k_pe is [S, 1, R] (usually).
                  kv_c_local = kv_c_normed.unsqueeze(1) # [S, 1, Lkv]
                  
                  k_ring = torch.cat([kv_c_local, k_pe], dim=-1)
