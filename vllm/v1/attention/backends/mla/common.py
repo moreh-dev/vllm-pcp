@@ -2053,13 +2053,29 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 w_pack = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
                 w_uk_t = w_pack[:, :self.qk_nope_head_dim, :] # [N, P, Lkv]
                 w_uv_t = w_pack[:, self.qk_nope_head_dim:, :] # [N, V, Lkv]
+
+                # Ensure weights are in the same dtype as input (to avoid Float8 errors)
+                # q_in is BFloat16, weights can be Float8
+                w_uk_t = w_uk_t.to(dtype=q_in.dtype)
+                w_uv_t = w_uv_t.to(dtype=q_in.dtype)
                 
                 # Absorb W_UK into Q_nope
                 q_nope = q_in[..., :self.qk_nope_head_dim] # [..., N, P]
                 q_pe_in = q_in[..., self.qk_nope_head_dim:] # [..., N, R]
                 
                 # Compute Q_abs = Q_nope @ W_UK
-                q_abs = torch.einsum('...np,npl->...nl', q_nope, w_uk_t)
+                # Use bmm: [N, Tokens, P] @ [N, P, L] -> [N, Tokens, L]
+                q_nope_shape = q_nope.shape
+                # Flatten batch/seq dims: [Tokens, N, P]
+                q_reshaped = q_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
+                # Transpose to [N, Tokens, P]
+                q_per_head = q_reshaped.transpose(0, 1)
+                
+                # w_uk_t is [N, P, Lkv]
+                q_abs_per_head = torch.matmul(q_per_head, w_uk_t) # [N, Tokens, Lkv]
+                
+                # Transpose back and reshape: [Tokens, N, Lkv] -> [..., N, Lkv]
+                q_abs = q_abs_per_head.transpose(0, 1).view(*q_nope_shape[:-1], self.kv_lora_rank)
                 
                 # Concatenate Q_abs and Q_pe -> [..., N, Lkv + R]
                 q_ring = torch.cat([q_abs, q_pe_in], dim=-1)
@@ -2091,7 +2107,20 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 
                 # Project Output using W_UV
                 # ring_out [..., N, Lkv] @ W_UV [N, V, Lkv]^T
-                final_out = torch.einsum('...nl,nvl->...nv', ring_out, w_uv_t)
+                # w_uv_t is [N, V, Lkv]. We want [N, Lkv, V] for multiplication
+                w_uv_trans = w_uv_t.transpose(-1, -2) # [N, Lkv, V]
+                
+                ring_out_shape = ring_out.shape
+                # Flatten: [Tokens, N, Lkv]
+                ring_out_reshaped = ring_out.view(-1, self.num_heads, self.kv_lora_rank)
+                # Transpose: [N, Tokens, Lkv]
+                ring_out_per_head = ring_out_reshaped.transpose(0, 1)
+                
+                # Matmul: [N, Tokens, Lkv] @ [N, Lkv, V] -> [N, Tokens, V]
+                final_out_per_head = torch.matmul(ring_out_per_head, w_uv_trans)
+                
+                # Restore: [Tokens, N, V] -> [..., N, V]
+                final_out = final_out_per_head.transpose(0, 1).view(*ring_out_shape[:-1], self.v_head_dim)
                 
                 output_prefill = final_out.flatten(start_dim=-2)
                 output.copy_(output_prefill)
