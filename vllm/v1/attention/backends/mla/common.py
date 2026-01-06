@@ -2047,78 +2047,54 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             sinks.fill_(float('-inf'))
 
             if use_compressed_ring:
-                 # Matrix Absorption Strategy:
-                 # Standard: Attention(Q_nope, KV_c @ W_UK)
-                 # Absorbed: Attention(Q_nope @ W_UK^T, KV_c)
-                 
-                 # 1. Extract W_UK and W_UV
-                 # kv_b_proj weight is [Out, In] -> [N(P+V), Lkv]
-                 # We need W_UK^T [N, P, Lkv] and W_UV [N, V, Lkv] (Transposed for final proj?)
-                 # Using the logic from process_weights_after_loading/kv_b_proj structure:
-                 w_pack = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
-                 
-                 w_uk_t = w_pack[:, :self.qk_nope_head_dim, :] # [N, P, Lkv]
-                 w_uv_t = w_pack[:, self.qk_nope_head_dim:, :] # [N, V, Lkv]
-                 
-                 # 2. Absorb W_UK into Q_nope
-                 # q_in is [Batch=1, S, N, P+R] (assuming it contains q_nope + q_pe concatenated?)
-                 # No, 'q' input to this function.
-                 # Let's check call site.
-                 # q is [1, S, N, P+R] (since it's prefill). No, q is [S, N, P+R] usually.
-                 # Inside _forward_prefill q signature: q: torch.Tensor
-                 # Code "q_nope, q_pe = ...".
-                 # The 'q' tensor comes from `forward`: `q = torch.cat([q_nope, q_pe], dim=-1)`
-                 
-                 q_nope = q_in[..., :self.qk_nope_head_dim] # [S, N, P]
-                 q_pe_in = q_in[..., self.qk_nope_head_dim:] # [S, N, R]
-                 
-                 # Compute Q_abs = Q_nope @ W_UK
-                 # [S, N, P] @ [N, P, Lkv] -> [S, N, Lkv]
-                 # Einsum: 'snp,npl->snl'
-                 q_abs = torch.einsum('snp,npl->snl', q_nope, w_uk_t)
-                 
-                 # Concatenate Q_abs and Q_pe
-                 # Q_ring = [Q_abs, Q_pe] -> [S, N, Lkv + R]
-                 q_ring = torch.cat([q_abs, q_pe_in], dim=-1)
-                 
-                 # 3. Construct K_ring and V_ring
-                 # K_ring = [KV_c, k_pe] -> [S, 1, Lkv + R]
-                 # V_ring = KV_c -> [S, 1, Lkv]
-                 
-                 # Input kv_c_normed is [S, Lkv].
-                 # k_pe is [S, 1, R] (usually).
-                 kv_c_local = kv_c_normed.unsqueeze(1) # [S, 1, Lkv]
-                 
-                 k_ring = torch.cat([kv_c_local, k_pe], dim=-1)
-                 v_ring = kv_c_local
-                 
-                 # Reshape for ring function (expects [B, S, ...])
-                 q_ring = q_ring.unsqueeze(0)
-                 k_ring = k_ring.unsqueeze(0)
-                 v_ring = v_ring.unsqueeze(0)
-                 
-                 # 4. Call Standard Ring Attention
-                 # Output will be [B, S, N, Lkv] (since V_ring dim is Lkv)
-                 ring_out = _moreh_gpt_attention_balanced_full(
-                    self,
-                    q_ring,
-                    k_ring,
-                    v_ring,
-                    sinks,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    window_size=(-1, -1),
-                )
-                 ring_out = ring_out.squeeze(0) # [S, N, Lkv]
-                 
-                 # 5. Project Output using W_UV
-                 # ring_out [S, N, Lkv] @ W_UV [N, V, Lkv]^T
-                 # w_uv_t is [N, V, Lkv]. We want to project Lkv -> V.
-                 # Einsum: 'snl,nvl->snv'
-                 final_out = torch.einsum('snl,nvl->snv', ring_out, w_uv_t)
-                 
-                 output_prefill = final_out.flatten(start_dim=-2)
-                 output.copy_(output_prefill)
+                # OPTIMIZATION 3: Matrix Absorption
+                # Extract W_UK and W_UV from kv_b_proj
+                # kv_b_proj weight is [Out, In] -> [N(P+V), Lkv]
+                w_pack = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+                w_uk_t = w_pack[:, :self.qk_nope_head_dim, :] # [N, P, Lkv]
+                w_uv_t = w_pack[:, self.qk_nope_head_dim:, :] # [N, V, Lkv]
+                
+                # Absorb W_UK into Q_nope
+                q_nope = q_in[..., :self.qk_nope_head_dim] # [..., N, P]
+                q_pe_in = q_in[..., self.qk_nope_head_dim:] # [..., N, R]
+                
+                # Compute Q_abs = Q_nope @ W_UK
+                q_abs = torch.einsum('...np,npl->...nl', q_nope, w_uk_t)
+                
+                # Concatenate Q_abs and Q_pe -> [..., N, Lkv + R]
+                q_ring = torch.cat([q_abs, q_pe_in], dim=-1)
+                
+                # Construct K_ring and V_ring
+                kv_c_local = kv_c_normed.unsqueeze(1) # [..., 1, Lkv]
+                k_ring = torch.cat([kv_c_local, k_pe], dim=-1)
+                v_ring = kv_c_local
+                
+                # Ensure correct shape for ring attention (usually [B, S, ...])
+                if q_ring.dim() == 3:
+                    q_ring = q_ring.unsqueeze(0)
+                    k_ring = k_ring.unsqueeze(0)
+                    v_ring = v_ring.unsqueeze(0)
+                
+                ring_out = _moreh_gpt_attention_balanced_full(
+                   self,
+                   q_ring,
+                   k_ring,
+                   v_ring,
+                   sinks,
+                   softmax_scale=self.scale,
+                   causal=True,
+                   window_size=(-1, -1),
+               )
+                
+                if ring_out.dim() == 4:
+                    ring_out = ring_out.squeeze(0)
+                
+                # Project Output using W_UV
+                # ring_out [..., N, Lkv] @ W_UV [N, V, Lkv]^T
+                final_out = torch.einsum('...nl,nvl->...nv', ring_out, w_uv_t)
+                
+                output_prefill = final_out.flatten(start_dim=-2)
+                output.copy_(output_prefill)
 
             else:
                 k_in = k
