@@ -1860,12 +1860,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
 
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            # MLA Matrix Absorption
+            v = kv_c_normed.unsqueeze(1).expand(-1, self.num_heads, -1)
+            k = torch.cat((kv_c_normed.unsqueeze(1), k_pe), dim=-1).expand(-1, self.num_heads, -1)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -1965,11 +1962,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 toks=toks,
             )
 
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            # MLA Matrix Absorption
+            v = kv_c_normed.unsqueeze(1).expand(-1, self.num_heads, -1)
+            k = torch.cat((kv_c_normed.unsqueeze(1), k_pe), dim=-1).expand(-1, self.num_heads, -1)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -2013,12 +2008,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         assert self.dcp_world_size is not None
 
         has_context = attn_metadata.prefill.chunked_context is not None
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # MLA Matrix Absorption
+        # Project Q to Latent
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # (S, N, D) -> (S, N, L)
+        q_nope = torch.einsum('snd,ndl->snl', q_nope, self.W_UK_T)
+        q = torch.cat((q_nope, q_pe), dim=-1)
 
-        k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+        # Prepare Absorned K, V
+        v = kv_c_normed.unsqueeze(1).expand(-1, self.num_heads, -1)
+        k = torch.cat((kv_c_normed.unsqueeze(1), k_pe), dim=-1).expand(-1, self.num_heads, -1)
 
         ring_size = get_rp_group().world_size
 
@@ -2076,8 +2075,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 lengths_global = [l * self.up_world_size for l in lengths_local]
                 ring_out = self._ulysses_output_all_to_all(ring_out, bounds_global, lengths_global)
 
-            output_prefill = ring_out[..., : v.shape[-1]].flatten(start_dim=-2)
-            output.copy_(output_prefill)
+            output_prefill = ring_out[..., : v.shape[-1]]
+            output_prefill = torch.einsum("snl,nlv->snv", output_prefill, self.W_UV)
+            output.copy_(output_prefill.flatten(start_dim=-2))
 
         else:
             output_prefill = self._run_prefill_new_tokens(
@@ -2110,17 +2110,20 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     context_output = context_output[..., : v.shape[-1]]
                     suffix_output = suffix_output[..., : v.shape[-1]]
 
-                output = output.view(-1, self.num_heads, self.v_head_dim)
+                output_latent = torch.empty_like(output.view(-1, self.num_heads, v.shape[-1]))
                 merge_attn_states(
-                    output=output,
+                    output=output_latent,
                     prefix_output=context_output,
                     prefix_lse=context_lse,
                     suffix_output=suffix_output,
                     suffix_lse=suffix_lse,
                 )
+                output_recons = torch.einsum("snl,nlv->snv", output_latent, self.W_UV)
+                output.copy_(output_recons.flatten(start_dim=-2))
             else:
-                output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
-                output.copy_(output_prefill)
+                output_prefill = output_prefill[..., : v.shape[-1]]
+                output_prefill = torch.einsum("snl,nlv->snv", output_prefill, self.W_UV)
+                output.copy_(output_prefill.flatten(start_dim=-2))
 
     @abstractmethod
     def _forward_decode(

@@ -171,14 +171,13 @@ def call_block_attn(
     # q, k: [bs, seqlen, num_heads, qk_head_dim]
     # v: [bs, seqlen, num_heads, v_head_dim]
     original_v_head_dim = value.shape[-1]
-    if value.shape[-1] != query.shape[-1]:
-        pad_len = query.shape[-1] - value.shape[-1]
-        value = F.pad(value, (0, pad_len))
-
     attn = "flash"
 
     if window_size != (-1, -1):
         attn = "triton"
+        if value.shape[-1] != query.shape[-1]:
+             pad_len = query.shape[-1] - value.shape[-1]
+             value = F.pad(value, (0, pad_len))
 
     if attn == "flash":
         out, lse, _ = flash_attn_func(
