@@ -165,7 +165,6 @@ def call_block_attn(
     value,
     softmax_scale,
     causal,
-    causal,
     window_size,
     pad_v=True,
 ):
