@@ -165,13 +165,15 @@ def call_block_attn(
     value,
     softmax_scale,
     causal,
+    causal,
     window_size,
+    pad_v=True,
 ):
     # Padding for MLA where qk_head_dim != v_head_dim
     # q, k: [bs, seqlen, num_heads, qk_head_dim]
     # v: [bs, seqlen, num_heads, v_head_dim]
     original_v_head_dim = value.shape[-1]
-    if value.shape[-1] != query.shape[-1]:
+    if pad_v and value.shape[-1] != query.shape[-1]:
         pad_len = query.shape[-1] - value.shape[-1]
         value = F.pad(value, (0, pad_len))
 
@@ -337,6 +339,8 @@ def _moreh_gpt_attention_balanced_full(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
 
+    pad_v = getattr(module, "_pad_v", True)
+
     assert causal, "Balanced Ring Attention requires causal=True"
     block_seq_len = query_layer.shape[1] // 2
     query1 = query_layer[:, block_seq_len:]
@@ -359,10 +363,10 @@ def _moreh_gpt_attention_balanced_full(
             block_out, block_lse = call_block_attn(
                 query_layer,
                 key,
-                value,
                 softmax_scale,
                 causal,
                 window_size,
+                pad_v=pad_v,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -374,10 +378,10 @@ def _moreh_gpt_attention_balanced_full(
                 block_out, block_lse = call_block_attn(
                     query_layer,
                     key0,
-                    value0,
                     softmax_scale,
                     False,
                     window_size,
+                    pad_v=pad_v,
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -385,10 +389,10 @@ def _moreh_gpt_attention_balanced_full(
             block_out, block_lse = call_block_attn(
                 query1,
                 key,
-                value,
                 softmax_scale,
                 False,
                 window_size,
+                pad_v=pad_v,
             )
             out, lse = update_out_and_lse(
                 out,
