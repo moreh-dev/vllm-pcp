@@ -373,7 +373,13 @@ def _moreh_mla_ring_attention_balanced_full(
         
         # We need to reshape for Linear projection:
         B, S, _ = kv_c_normed_layer.shape
-        kv_nope_flat = module.kv_b_proj(kv_c_normed_layer.view(-1, kv_c_normed_layer.shape[-1]))[0]
+        
+        weight = module.kv_b_proj.weight.to(torch.bfloat16)
+        bias = getattr(module.kv_b_proj, "bias", None)
+        if bias is not None:
+            bias = bias.to(torch.bfloat16)
+
+        kv_nope_flat = F.linear(kv_c_normed_layer.view(-1, kv_c_normed_layer.shape[-1]), weight, bias)
         kv_nope = kv_nope_flat.view(B, S, module.num_heads, module.qk_nope_head_dim + module.v_head_dim)
         k_nope, v = kv_nope.split([module.qk_nope_head_dim, module.v_head_dim], dim=-1)
         
