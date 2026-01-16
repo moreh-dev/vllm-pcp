@@ -319,7 +319,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 ) and kv_layer.shape[0] == 2:
                     gather_dim = 1
 
+                logger.info("Rank %d starting all_gather for req %s", self._rank, request_id)
                 kv_cache = rp_group.all_gather(kv_cache, dim=gather_dim)
+                logger.info("Rank %d finished all_gather, shape: %s", self._rank, kv_cache.shape)
 
                 # Compact the KV cache if needed (RP fragmentation)
                 if rp_group.rank_in_group == 0:
@@ -330,6 +332,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     # where consistent `block_ids` across ranks resulted in duplicated 
                     # incomplete blocks that need merging.
                     if current_blocks > num_expected_blocks:
+                        logger.info("Rank %d starting compaction. Current: %d, Expected: %d", self._rank, current_blocks, num_expected_blocks)
                         
                         # Detect block_size dimension
                         bs = self._block_size
@@ -360,15 +363,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                             base_tokens_per_rank = total_tokens // world_size
                             remainder = total_tokens % world_size
                             
-                            # Helper to slice tensor at bs_dim
-                            def copy_slice(src, dst, b_idx, start, end):
-                                # This handles generic shapes by constructing slice objects
-                                idx = [slice(None)] * src.ndim
-                                idx[gather_dim] = b_idx
-                                idx[bs_dim] = slice(start, end)
-                                dst[tuple(idx)] = src[tuple(idx)]
-
                             for rank in range(world_size):
+                                logger.info("Compacting rank %d/%d", rank, world_size)
                                 # Calculate rank's token range
                                 start_token = rank * base_tokens_per_rank + min(rank, remainder)
                                 tokens_this_rank = base_tokens_per_rank + (1 if rank < remainder else 0)
