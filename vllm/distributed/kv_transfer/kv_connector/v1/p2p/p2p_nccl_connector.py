@@ -17,7 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
 )
-from vllm.distributed.parallel_state import get_world_group
+from vllm.distributed.parallel_state import get_rp_group, get_world_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -302,9 +302,28 @@ class P2pNcclConnector(KVConnectorBase_V1):
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
-            )
+
+            rp_group = get_rp_group()
+            if rp_group is not None and rp_group.world_size > 1:
+                # Ring Parallelism:
+                # Gather the KV cache from all ranks in the ring
+                # and send it from the first rank.
+                gather_dim = 0
+                if not (
+                    isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
+                ) and layer.shape[0] == 2:
+                    gather_dim = 1
+                
+                kv_cache = rp_group.all_gather(kv_cache, dim=gather_dim)
+
+                if rp_group.rank_in_group == 0:
+                    self.p2p_nccl_engine.send_tensor(
+                        request_id + "#" + layer_name, kv_cache, remote_address
+                    )
+            else:
+                self.p2p_nccl_engine.send_tensor(
+                    request_id + "#" + layer_name, kv_cache, remote_address
+                )
 
     def wait_for_save(self):
         if self.is_producer:
