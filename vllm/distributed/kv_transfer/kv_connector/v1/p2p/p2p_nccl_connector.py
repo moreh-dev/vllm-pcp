@@ -310,8 +310,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # and send it from the first rank.
                 gather_dim = 0
                 if not (
-                    isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-                ) and layer.shape[0] == 2:
+                    isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+                ) and kv_layer.shape[0] == 2:
                     gather_dim = 1
                 
                 kv_cache = rp_group.all_gather(kv_cache, dim=gather_dim)
