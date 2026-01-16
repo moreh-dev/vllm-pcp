@@ -168,7 +168,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if len(block_ids) == num_block:
                     layer[block_ids, ...] = kv_cache
                 else:
-                    layer[block_ids[:num_block], ...] = kv_cache
+                    valid_tokens = min(len(block_ids), num_block)
+                    layer[block_ids[:valid_tokens], ...] = kv_cache[:valid_tokens, ...]
                     logger.warning(
                         "🚧kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
@@ -183,7 +184,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if len(block_ids) == num_block:
                     layer[:, block_ids, ...] = kv_cache
                 else:
-                    layer[:, block_ids[:num_block], ...] = kv_cache
+                    valid_tokens = min(len(block_ids), num_block)
+                    layer[:, block_ids[:valid_tokens], ...] = kv_cache[
+                        :, :valid_tokens, ...
+                    ]
                     logger.warning(
                         "🚧kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
