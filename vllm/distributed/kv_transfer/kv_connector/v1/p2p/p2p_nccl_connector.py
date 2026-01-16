@@ -103,6 +103,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if role == KVConnectorRole.WORKER
             else None
         )
+        logger.info("DEBUG: P2pNcclConnector initialized. Rank: %d, Role: %s, is_producer: %s", self._rank, role, self.is_producer)
 
     # ==============================
     # Worker-side methods
@@ -124,6 +125,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Only consumer/decode loads KV Cache
         if self.is_producer:
             return
+
+        logger.info("DEBUG: start_load_kv called. Rank: %d", self._rank)
 
         assert self.p2p_nccl_engine is not None
 
@@ -266,6 +269,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         assert self.p2p_nccl_engine is not None
+        
+        # DEBUG LOG
+        logger.info("DEBUG: save_kv_layer called. Rank: %d, is_producer: %s", self._rank, self.is_producer)
 
         def extract_kv_from_layer(
             layer: torch.Tensor,
@@ -527,6 +533,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
 
+        logger.info("DEBUG: build_connector_meta called. Rank: %d, New: %d, Cached: %d", self._rank, len(scheduler_output.scheduled_new_reqs), len(scheduler_output.scheduled_cached_reqs.req_ids))
+
         meta = P2pNcclConnectorMetadata()
 
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -544,6 +552,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     )
                     continue
                 # the request's prompt is not chunked prefill
+                logger.info("DEBUG: Adding NEW request to meta. ID: %s", new_req.req_id)
                 meta.add_request(
                     request_id=new_req.req_id,
                     token_ids=new_req.prompt_token_ids or [],
