@@ -377,32 +377,61 @@ class P2pNcclConnector(KVConnectorBase_V1):
                                 if tokens_this_rank <= 0:
                                     continue
                                 
-                                # Rank's data is in the gathered tensor at [rank * num_expected_blocks : ...]
-                                # But wait, gathered_kv is [rank0_blocks, rank1_blocks, ...]
-                                # So logical block 'b' for rank 'r' is at index `rank * num_expected_blocks + b`
                                 rank_offset_blocks = rank * num_expected_blocks
-                                
-                                # Iterate over blocks mapping to this rank's range
                                 start_blk = start_token // bs
                                 end_blk = (end_token - 1) // bs
                                 
-                                for b in range(start_blk, end_blk + 1):
-                                    blk_start_token = b * bs
-                                    blk_end_token = (b + 1) * bs
+                                # Helper for slice assignment
+                                def copy_part(b_idx, copy_start_offset, copy_end_offset):
+                                    src_blk_idx = rank_offset_blocks + b_idx
+                                    # dst[b_idx, start:end] = src[src_idx, start:end]
                                     
-                                    valid_start = max(start_token, blk_start_token)
-                                    valid_end = min(end_token, blk_end_token)
+                                    # Construct slices
+                                    dst_idx = [slice(None)] * kv_cache.ndim
+                                    dst_idx[gather_dim] = b_idx
+                                    dst_idx[bs_dim] = slice(copy_start_offset, copy_end_offset)
                                     
-                                    if valid_end > valid_start:
-                                        # Offsets relative to the block start
-                                        local_start = valid_start % bs
-                                        local_end = valid_end % bs
-                                        if local_end == 0: local_end = bs
+                                    src_idx = [slice(None)] * kv_cache.ndim
+                                    src_idx[gather_dim] = src_blk_idx
+                                    src_idx[bs_dim] = slice(copy_start_offset, copy_end_offset)
+                                    
+                                    compact_kv[tuple(dst_idx)] = kv_cache[tuple(src_idx)]
+
+                                if start_blk == end_blk:
+                                    # Single block (potentially partial)
+                                    s = start_token % bs
+                                    e = (end_token - 1) % bs + 1
+                                    copy_part(start_blk, s, e)
+                                else:
+                                    # First block (partial end of block?)
+                                    # Covers start_token to (start_blk+1)*bs
+                                    s = start_token % bs
+                                    if s < bs:
+                                        copy_part(start_blk, s, bs)
+                                    
+                                    # Middle blocks (Full)
+                                    # [start_blk+1 ... end_blk-1]
+                                    if end_blk > start_blk + 1:
+                                        # Bulk copy
+                                        num_mid = end_blk - (start_blk + 1)
                                         
-                                        # Source comes from the rank's section of gathered_kv
-                                        # Destination goes to the compacted kv
-                                        src_block_idx = rank_offset_blocks + b
-                                        copy_slice(kv_cache, compact_kv, b, local_start, local_end)
+                                        dst_idx = [slice(None)] * kv_cache.ndim
+                                        dst_idx[gather_dim] = slice(start_blk + 1, end_blk)
+                                        # Full block on bs_dim
+                                        
+                                        src_idx = [slice(None)] * kv_cache.ndim
+                                        src_idx[gather_dim] = slice(
+                                            rank_offset_blocks + start_blk + 1, 
+                                            rank_offset_blocks + end_blk
+                                        )
+                                        
+                                        compact_kv[tuple(dst_idx)] = kv_cache[tuple(src_idx)]
+                                    
+                                    # Last block (partial start of block?)
+                                    # Covers end_blk*bs to end_token
+                                    e = (end_token - 1) % bs + 1
+                                    if e > 0:
+                                        copy_part(end_blk, 0, e)
                                         
                             kv_cache = compact_kv
                         else:
