@@ -307,6 +307,7 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
+    @maybe_transfer_kv_layer
     def forward(
         self,
         query: torch.Tensor,
@@ -668,6 +669,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
         self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
+    @maybe_transfer_kv_layer
     def forward(
         self,
         q: torch.Tensor,
