@@ -314,13 +314,104 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # and send it from the first rank.
                 gather_dim = 0
                 if not (
-                    isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+                    isinstance(attn_metadata, MLACommonMetadata)
+                    or kv_layer.shape[1] == 2
                 ) and kv_layer.shape[0] == 2:
                     gather_dim = 1
-                
+
                 kv_cache = rp_group.all_gather(kv_cache, dim=gather_dim)
 
+                # Compact the KV cache if needed (RP fragmentation)
                 if rp_group.rank_in_group == 0:
+                    num_expected_blocks = len(request.block_ids)
+                    current_blocks = kv_cache.shape[gather_dim]
+                    
+                    # If we have more blocks than expected, it implies RP fragmentation
+                    # where consistent `block_ids` across ranks resulted in duplicated 
+                    # incomplete blocks that need merging.
+                    if current_blocks > num_expected_blocks:
+                        
+                        # Detect block_size dimension
+                        bs = self._block_size
+                        bs_dim = -1
+                        for i, s in enumerate(kv_cache.shape):
+                            # Skip the block counts dimension (gather_dim)
+                            if i == gather_dim:
+                                continue
+                            if s == bs:
+                                bs_dim = i
+                                break
+                        
+                        if bs_dim != -1:
+                            # Create compacted tensor
+                            compact_shape = list(kv_cache.shape)
+                            compact_shape[gather_dim] = num_expected_blocks
+                            compact_kv = torch.empty(
+                                compact_shape, 
+                                dtype=kv_cache.dtype, 
+                                device=kv_cache.device
+                            )
+                            
+                            # Token distribution logic (Round-robin or Chunked?)
+                            # vLLM RP typically uses chunked split for prefill.
+                            # We assume chunked split here based on general RP behavior.
+                            world_size = rp_group.world_size
+                            total_tokens = request.num_tokens
+                            base_tokens_per_rank = total_tokens // world_size
+                            remainder = total_tokens % world_size
+                            
+                            # Helper to slice tensor at bs_dim
+                            def copy_slice(src, dst, b_idx, start, end):
+                                # This handles generic shapes by constructing slice objects
+                                idx = [slice(None)] * src.ndim
+                                idx[gather_dim] = b_idx
+                                idx[bs_dim] = slice(start, end)
+                                dst[tuple(idx)] = src[tuple(idx)]
+
+                            for rank in range(world_size):
+                                # Calculate rank's token range
+                                start_token = rank * base_tokens_per_rank + min(rank, remainder)
+                                tokens_this_rank = base_tokens_per_rank + (1 if rank < remainder else 0)
+                                end_token = start_token + tokens_this_rank
+                                
+                                if tokens_this_rank <= 0:
+                                    continue
+                                
+                                # Rank's data is in the gathered tensor at [rank * num_expected_blocks : ...]
+                                # But wait, gathered_kv is [rank0_blocks, rank1_blocks, ...]
+                                # So logical block 'b' for rank 'r' is at index `rank * num_expected_blocks + b`
+                                rank_offset_blocks = rank * num_expected_blocks
+                                
+                                # Iterate over blocks mapping to this rank's range
+                                start_blk = start_token // bs
+                                end_blk = (end_token - 1) // bs
+                                
+                                for b in range(start_blk, end_blk + 1):
+                                    blk_start_token = b * bs
+                                    blk_end_token = (b + 1) * bs
+                                    
+                                    valid_start = max(start_token, blk_start_token)
+                                    valid_end = min(end_token, blk_end_token)
+                                    
+                                    if valid_end > valid_start:
+                                        # Offsets relative to the block start
+                                        local_start = valid_start % bs
+                                        local_end = valid_end % bs
+                                        if local_end == 0: local_end = bs
+                                        
+                                        # Source comes from the rank's section of gathered_kv
+                                        # Destination goes to the compacted kv
+                                        src_block_idx = rank_offset_blocks + b
+                                        copy_slice(kv_cache, compact_kv, b, local_start, local_end)
+                                        
+                            kv_cache = compact_kv
+                        else:
+                            logger.warning(
+                                "Could not detect block_size (%d) in kv_cache shape %s. "
+                                "Skipping RP compaction.", 
+                                bs, kv_cache.shape
+                            )
+
                     self.p2p_nccl_engine.send_tensor(
                         request_id + "#" + layer_name, kv_cache, remote_address
                     )
