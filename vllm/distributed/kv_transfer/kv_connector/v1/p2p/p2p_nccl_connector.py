@@ -359,6 +359,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         rp_world_size = get_rp_group().world_size
         up_world_size = get_up_group().world_size
         sp_enabled = rp_world_size > 1 or up_world_size > 1
+        sp_group = None
         
         if sp_enabled:
             logger.info(
@@ -392,156 +393,133 @@ class P2pNcclConnector(KVConnectorBase_V1):
             
             # If sequence parallelism is enabled, gather full KV cache from all ranks
             if sp_enabled:
-                # Each rank has a shard of the sequence dimension (dim=0 for MLA)
+                num_blocks_per_rank = kv_cache.shape[1 if kv_cache.shape[0] == 2 else 0]
+                
+                # Each rank has a shard of the sequence dimension
                 # Perform all-gather to collect the full KV cache
                 pre_gather_shape = kv_cache.shape
-                kv_cache = sp_group.all_gather(kv_cache, dim=0)
+                # dim 1 is sequence for FlashAttention [2, num_blocks, ...], 
+                # dim 0 for MLA/FlashInfer [num_blocks, 2, ...]
+                gather_dim = 1 if kv_cache.shape[0] == 2 else 0
+                kv_cache = sp_group.all_gather(kv_cache, dim=gather_dim)
+                
                 logger.info(
                     "[PREFILL] All-gathered KV cache: "
-                    "pre_gather_shape=%s, post_gather_shape=%s",
+                    "pre_gather_shape=%s, post_gather_shape=%s, gather_dim=%d",
                     pre_gather_shape,
                     kv_cache.shape,
+                    gather_dim,
                 )
                 
                 # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
-                # We need to consolidate them into compact blocks.
-                # 
-                # Example with 2 ranks, block_size=8, 4 tokens total:
-                #   Before: [[T0,T1,_,_,_,_,_,_], [T2,T3,_,_,_,_,_,_]]  (2 blocks, 4 tokens total)
-                #   After:  [[T0,T1,T2,T3,_,_,_,_]]                     (1 block, 4 tokens total)
-                #
-                # For FlashInfer format: [num_blocks, 2, num_heads, block_size, head_dim]
-                if isinstance(attn_metadata, MLACommonMetadata) or kv_cache.shape[1] == 2:
-                    # FlashInfer/MLA format
-                    num_gathered_blocks = kv_cache.shape[0]
-                    block_size = kv_cache.shape[3]
+                # We need to extract the actual tokens from each rank's blocks and concatenate them.
+                # This is because each rank's last block might be partially filled.
+                
+                total_tokens = request.num_tokens
+                block_size = self._block_size
+                num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                
+                sp_size = sp_group.world_size
+                tokens_per_rank = total_tokens // sp_size
+                remainder = total_tokens % sp_size
+                
+                all_rank_tokens = []
+                for i in range(sp_size):
+                    this_rank_tokens = tokens_per_rank + (1 if i < remainder else 0)
+                    if this_rank_tokens == 0:
+                        continue
                     
-                    # Get the actual number of tokens from request metadata
-                    # NOT the total number of block slots
-                    total_tokens = request.num_tokens
-                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
-                    
-                    logger.info(
-                        "[PREFILL] Re-packing KV cache: "
-                        "num_gathered_blocks=%d, total_tokens=%d, "
-                        "num_compact_blocks=%d, block_size=%d",
-                        num_gathered_blocks,
-                        total_tokens,
-                        num_compact_blocks,
-                        block_size,
-                    )
-                    
-                    # Reshape to merge all blocks along the sequence dimension
-                    # [num_blocks, 2, num_heads, block_size, head_dim] 
-                    # -> [num_blocks * block_size, 2, num_heads, head_dim]
-                    kv_cache = kv_cache.reshape(
-                        num_gathered_blocks * block_size, 
-                        kv_cache.shape[1],  # 2 (K and V)
-                        kv_cache.shape[2],  # num_heads
-                        kv_cache.shape[4],  # head_dim
-                    )
-                    
-                    # Extract only the actual tokens (not the empty padding slots)
-                    kv_cache = kv_cache[:total_tokens]
-                    
-                    # Pad to make it divisible by block_size
-                    if total_tokens % block_size != 0:
-                        padding_size = num_compact_blocks * block_size - total_tokens
-                        padding = torch.zeros(
-                            padding_size,
-                            kv_cache.shape[1],
-                            kv_cache.shape[2],
-                            kv_cache.shape[3],
-                            dtype=kv_cache.dtype,
-                            device=kv_cache.device,
+                    if kv_cache.shape[0] == 2: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
+                        # Extract this rank's blocks
+                        rank_blocks = kv_cache[:, i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                        # Shape: [2, num_blocks, num_heads, block_size, head_dim]
+                        
+                        # Permute to make blocks and block_size adjacent: [2, num_blocks, block_size, num_heads, head_dim]
+                        # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
+                        rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).reshape(
+                            2, 
+                            num_blocks_per_rank * block_size, 
+                            kv_cache.shape[2], 
+                            kv_cache.shape[4]
                         )
-                        kv_cache = torch.cat([kv_cache, padding], dim=0)
-                    
-                    # Reshape into compact blocks
-                    kv_cache = kv_cache.reshape(
-                        num_compact_blocks,
-                        block_size,
-                        kv_cache.shape[1],  # 2 (K and V)
-                        kv_cache.shape[2],  # num_heads
-                        kv_cache.shape[3],  # head_dim
-                    ).permute(0, 2, 3, 1, 4).contiguous()
-                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
-                    
-                    logger.info(
-                        "[PREFILL] Re-packed KV cache: final_shape=%s",
-                        kv_cache.shape,
-                    )
-                    
-                elif kv_cache.shape[0] == 2:
-                    # FlashAttention format: [2, num_blocks, num_heads, block_size, head_dim]
-                    num_gathered_blocks = kv_cache.shape[1]
-                    block_size = kv_cache.shape[3]
-                    
-                    # Get the actual number of tokens
-                    total_tokens = request.num_tokens
-                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
-                    
-                    logger.info(
-                        "[PREFILL] Re-packing KV cache (FlashAttention): "
-                        "num_gathered_blocks=%d, total_tokens=%d, "
-                        "num_compact_blocks=%d, block_size=%d",
-                        num_gathered_blocks,
-                        total_tokens,
-                        num_compact_blocks,
-                        block_size,
-                    )
-                    
-                    # Reshape to merge blocks: [2, num_blocks * block_size, num_heads, head_dim]
-                    kv_cache = kv_cache.reshape(
-                        2,  # K and V
-                        num_gathered_blocks * block_size,
-                        kv_cache.shape[2],  # num_heads
-                        kv_cache.shape[4],  # head_dim
-                    )
-                    
-                    # Extract only actual tokens
-                    kv_cache = kv_cache[:, :total_tokens]
-                    
-                    # Pad if necessary
-                    if total_tokens % block_size != 0:
-                        padding_size = num_compact_blocks * block_size - total_tokens
+                        # Take actual tokens for this rank
+                        all_rank_tokens.append(rank_flat[:, :this_rank_tokens])
+                    else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
+                        # Extract this rank's blocks
+                        rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                        # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
+                        
+                        # Permute to make blocks and block_size adjacent: [num_blocks, block_size, 2, num_heads, head_dim]
+                        # Then flatten into tokens: [num_blocks * block_size, 2, num_heads, head_dim]
+                        rank_flat = rank_blocks.permute(0, 3, 1, 2, 4).reshape(
+                            num_blocks_per_rank * block_size, 
+                            kv_cache.shape[1], 
+                            kv_cache.shape[2], 
+                            kv_cache.shape[4]
+                        )
+                        # Take actual tokens for this rank
+                        all_rank_tokens.append(rank_flat[:this_rank_tokens])
+                
+                # Concatenate actual tokens from all ranks
+                if kv_cache.shape[0] == 2:
+                    kv_cache = torch.cat(all_rank_tokens, dim=1) # dim 1 is sequence for FA
+                else:
+                    kv_cache = torch.cat(all_rank_tokens, dim=0) # dim 0 is sequence for MLA
+                
+                # Pad to make it divisible by block_size
+                current_tokens = kv_cache.shape[1 if kv_cache.shape[0] == 2 else 0]
+                if current_tokens < num_compact_blocks * block_size:
+                    padding_size = num_compact_blocks * block_size - current_tokens
+                    if kv_cache.shape[0] == 2:
                         padding = torch.zeros(
-                            2,
-                            padding_size,
-                            kv_cache.shape[2],
-                            kv_cache.shape[3],
-                            dtype=kv_cache.dtype,
-                            device=kv_cache.device,
+                            2, padding_size, kv_cache.shape[2], kv_cache.shape[3], 
+                            dtype=kv_cache.dtype, device=kv_cache.device
                         )
                         kv_cache = torch.cat([kv_cache, padding], dim=1)
-                    
-                    # Reshape into compact blocks
+                    else:
+                        padding = torch.zeros(
+                            padding_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3], 
+                            dtype=kv_cache.dtype, device=kv_cache.device
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=0)
+                
+                # Reshape into compact blocks
+                if kv_cache.shape[0] == 2: # FA
                     kv_cache = kv_cache.reshape(
-                        2,
-                        num_compact_blocks,
-                        block_size,
-                        kv_cache.shape[2],  # num_heads
-                        kv_cache.shape[3],  # head_dim
-                    ).permute(1, 0, 3, 2, 4).contiguous()
-                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
-                    
-                    logger.info(
-                        "[PREFILL] Re-packed KV cache (FlashAttention): final_shape=%s",
-                        kv_cache.shape,
-                    )
+                        2, num_compact_blocks, block_size, kv_cache.shape[2], kv_cache.shape[3]
+                    ).permute(0, 1, 3, 2, 4).contiguous()
+                else: # MLA
+                    kv_cache = kv_cache.reshape(
+                        num_compact_blocks, block_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
+                    ).permute(0, 2, 3, 1, 4).contiguous()
+
+                logger.info(
+                    "[PREFILL] Re-packed KV cache: final_shape=%s",
+                    kv_cache.shape,
+                )
             
-            logger.info(
-                "[PREFILL] Sending KV cache: request=%s, layer=%s, "
-                "shape=%s, remote_address=%s",
-                request_id,
-                layer_name,
-                kv_cache.shape,
-                remote_address,
-            )
-            
-            self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
-            )
+            # Now send. In sequence parallelism mode, all ranks gathered the same KV cache.
+            # Only the first rank in SP group should send it to the decode node
+            # to avoid redundant sends and potential hangs.
+            if not sp_enabled or sp_group.rank_in_group == 0:
+                logger.info(
+                    "[PREFILL] Sending KV cache: request=%s, layer=%s, "
+                    "shape=%s, remote_address=%s",
+                    request_id,
+                    layer_name,
+                    kv_cache.shape,
+                    remote_address,
+                )
+                self.p2p_nccl_engine.send_tensor(
+                    request_id + "#" + layer_name, kv_cache, remote_address
+                )
+            else:
+                logger.info(
+                    "[PREFILL] Skipping redundant KV cache send: request=%s, layer=%s, rank=%d",
+                    request_id,
+                    layer_name,
+                    sp_group.rank_in_group,
+                )
 
     def wait_for_save(self):
         if self.is_producer:
