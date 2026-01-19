@@ -130,6 +130,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             return
+        
+        logger.info("[DECODE] Starting start_load_kv")
 
         def inject_kv_into_layer(
             layer: torch.Tensor,
@@ -147,7 +149,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
               - FlashAttention: KV tensors are indexed along the second
                 dimension.
 
-            If the number of provided block IDs does not match the number of KV
+            if the number of provided block IDs does not match the number of KV
             blocks, only the overlapping portion is updated, and a warning is
             logged.
 
@@ -160,6 +162,15 @@ class P2pNcclConnector(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
+            logger.info(
+                "[DECODE] Injecting KV cache: request=%s, "
+                "kv_cache.shape=%s, layer.shape=%s, num_blocks=%d",
+                request_id,
+                kv_cache.shape,
+                layer.shape,
+                len(block_ids),
+            )
+            
             if (
                 isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
             ):  # MLA or FlashInfer
@@ -167,10 +178,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 self.check_tensors_except_dim(layer, kv_cache, 0)
                 if len(block_ids) == num_block:
                     layer[block_ids, ...] = kv_cache
+                    logger.info(
+                        "[DECODE] Injected KV cache successfully (MLA/FlashInfer): "
+                        "request=%s, num_blocks=%d",
+                        request_id,
+                        num_block,
+                    )
                 else:
                     layer[block_ids[:num_block], ...] = kv_cache
                     logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
+                        "🚧[DECODE] kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
                         len(block_ids),
                         num_block,
@@ -182,10 +199,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 self.check_tensors_except_dim(layer, kv_cache, 1)
                 if len(block_ids) == num_block:
                     layer[:, block_ids, ...] = kv_cache
+                    logger.info(
+                        "[DECODE] Injected KV cache successfully (FlashAttention): "
+                        "request=%s, num_blocks=%d",
+                        request_id,
+                        num_block,
+                    )
                 else:
                     layer[:, block_ids[:num_block], ...] = kv_cache
                     logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
+                        "🚧[DECODE] kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
                         len(block_ids),
                         num_block,
@@ -198,6 +221,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         if metadata is None:
             return
+        
+        logger.info(
+            "[DECODE] Loading KV cache for %d requests",
+            len(metadata.requests),
+        )
 
         # Load the KV for each request each layer
         for request in metadata.requests:
@@ -216,13 +244,30 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                 layer = kv_cache[forward_context.virtual_engine]
 
+                logger.info(
+                    "[DECODE] Requesting KV cache: request=%s, layer=%s",
+                    request.request_id,
+                    layer_name,
+                )
+                
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
                     request.request_id + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
+                    logger.warning(
+                        "🚧[DECODE] kv_cache is None for request=%s, layer=%s",
+                        request.request_id,
+                        layer_name,
+                    )
                     continue
+                
+                logger.info(
+                    "[DECODE] Received KV cache: request=%s, layer=%s, shape=%s",
+                    request.request_id,
+                    layer_name,
+                    kv_cache.shape,
+                )
 
                 inject_kv_into_layer(
                     layer, kv_cache, request.block_ids, request.request_id
@@ -262,6 +307,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         assert self.p2p_nccl_engine is not None
+        
+        logger.info(
+            "[PREFILL] Starting save_kv_layer for layer=%s, "
+            "kv_layer.shape=%s",
+            layer_name,
+            kv_layer.shape,
+        )
 
         def extract_kv_from_layer(
             layer: torch.Tensor,
@@ -296,12 +348,63 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
+        
+        # Detect sequence parallelism mode
+        rp_world_size = get_rp_group().world_size
+        up_world_size = get_up_group().world_size
+        sp_enabled = rp_world_size > 1 or up_world_size > 1
+        
+        if sp_enabled:
+            logger.info(
+                "[PREFILL] Sequence parallelism enabled: "
+                "rp_world_size=%d, up_world_size=%d",
+                rp_world_size,
+                up_world_size,
+            )
+            # Determine which SP group to use for all-gather
+            if rp_world_size > 1:
+                sp_group = get_rp_group()
+            else:
+                sp_group = get_up_group()
+        
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            
+            logger.info(
+                "[PREFILL] Extracted KV cache for request=%s, layer=%s, "
+                "shape=%s, num_blocks=%d",
+                request_id,
+                layer_name,
+                kv_cache.shape,
+                len(request.block_ids),
+            )
+            
+            # If sequence parallelism is enabled, gather full KV cache from all ranks
+            if sp_enabled:
+                # Each rank has a shard of the sequence dimension (dim=0 for MLA)
+                # Perform all-gather to collect the full KV cache
+                pre_gather_shape = kv_cache.shape
+                kv_cache = sp_group.all_gather(kv_cache, dim=0)
+                logger.info(
+                    "[PREFILL] All-gathered KV cache: "
+                    "pre_gather_shape=%s, post_gather_shape=%s",
+                    pre_gather_shape,
+                    kv_cache.shape,
+                )
+            
+            logger.info(
+                "[PREFILL] Sending KV cache: request=%s, layer=%s, "
+                "shape=%s, remote_address=%s",
+                request_id,
+                layer_name,
+                kv_cache.shape,
+                remote_address,
+            )
+            
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
@@ -309,7 +412,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
+            logger.info("[PREFILL] Waiting for all KV cache sends to complete...")
             self.p2p_nccl_engine.wait_for_sent()
+            logger.info("[PREFILL] All KV cache sends completed")
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any

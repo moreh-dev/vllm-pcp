@@ -427,6 +427,16 @@ class P2pNcclEngine:
                         remote_address.decode(),
                         data,
                     )
+                
+                logger.info(
+                    "[NCCL-RECV] Received tensor: tensor_id=%s, shape=%s, "
+                    "dtype=%s, remote=%s, stored_in_pool=%s",
+                    tensor_id,
+                    data["shape"],
+                    data["dtype"],
+                    remote_address.decode(),
+                    isinstance(tensor, tuple),
+                )
 
                 with self.recv_store_cv:
                     self.recv_store[tensor_id] = tensor
@@ -529,8 +539,22 @@ class P2pNcclEngine:
                 response.decode(),
             )
             return False
+        
+        logger.info(
+            "[NCCL-SEND] Sending tensor: tensor_id=%s, shape=%s, "
+            "dtype=%s, remote=%s",
+            item.tensor_id,
+            tensor.shape,
+            tensor.dtype,
+            item.remote_address,
+        )
 
         self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
+        
+        logger.info(
+            "[NCCL-SEND] Completed sending: tensor_id=%s",
+            item.tensor_id,
+        )
 
         if self.send_type == "PUT_ASYNC":
             self.have_sent_tensor_id(item.tensor_id)
