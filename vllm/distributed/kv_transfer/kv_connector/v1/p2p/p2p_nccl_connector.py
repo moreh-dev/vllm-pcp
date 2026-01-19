@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import regex as re
 import torch
 
+from vllm.distributed import (
+    get_up_group,
+    get_rp_group,
+)
+
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
