@@ -406,7 +406,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
                 # We need to consolidate them into compact blocks.
                 # 
-                # Example with 2 ranks, block_size=8:
+                # Example with 2 ranks, block_size=8, 4 tokens total:
                 #   Before: [[T0,T1,_,_,_,_,_,_], [T2,T3,_,_,_,_,_,_]]  (2 blocks, 4 tokens total)
                 #   After:  [[T0,T1,T2,T3,_,_,_,_]]                     (1 block, 4 tokens total)
                 #
@@ -415,6 +415,21 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     # FlashInfer/MLA format
                     num_gathered_blocks = kv_cache.shape[0]
                     block_size = kv_cache.shape[3]
+                    
+                    # Get the actual number of tokens from request metadata
+                    # NOT the total number of block slots
+                    total_tokens = request.num_tokens
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    logger.info(
+                        "[PREFILL] Re-packing KV cache: "
+                        "num_gathered_blocks=%d, total_tokens=%d, "
+                        "num_compact_blocks=%d, block_size=%d",
+                        num_gathered_blocks,
+                        total_tokens,
+                        num_compact_blocks,
+                        block_size,
+                    )
                     
                     # Reshape to merge all blocks along the sequence dimension
                     # [num_blocks, 2, num_heads, block_size, head_dim] 
@@ -426,12 +441,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         kv_cache.shape[4],  # head_dim
                     )
                     
-                    # Now reshape back into compact blocks
-                    # [total_tokens, 2, num_heads, head_dim]
-                    # -> [num_compact_blocks, block_size, 2, num_heads, head_dim]
-                    # -> [num_compact_blocks, 2, num_heads, block_size, head_dim]
-                    total_tokens = kv_cache.shape[0]
-                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    # Extract only the actual tokens (not the empty padding slots)
+                    kv_cache = kv_cache[:total_tokens]
                     
                     # Pad to make it divisible by block_size
                     if total_tokens % block_size != 0:
@@ -457,12 +468,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
                     
                     logger.info(
-                        "[PREFILL] Re-packed KV cache: "
-                        "num_gathered_blocks=%d, num_compact_blocks=%d, "
-                        "total_tokens=%d, final_shape=%s",
-                        num_gathered_blocks,
-                        num_compact_blocks,
-                        total_tokens,
+                        "[PREFILL] Re-packed KV cache: final_shape=%s",
                         kv_cache.shape,
                     )
                     
@@ -470,6 +476,20 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     # FlashAttention format: [2, num_blocks, num_heads, block_size, head_dim]
                     num_gathered_blocks = kv_cache.shape[1]
                     block_size = kv_cache.shape[3]
+                    
+                    # Get the actual number of tokens
+                    total_tokens = request.num_tokens
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    logger.info(
+                        "[PREFILL] Re-packing KV cache (FlashAttention): "
+                        "num_gathered_blocks=%d, total_tokens=%d, "
+                        "num_compact_blocks=%d, block_size=%d",
+                        num_gathered_blocks,
+                        total_tokens,
+                        num_compact_blocks,
+                        block_size,
+                    )
                     
                     # Reshape to merge blocks: [2, num_blocks * block_size, num_heads, head_dim]
                     kv_cache = kv_cache.reshape(
@@ -479,8 +499,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         kv_cache.shape[4],  # head_dim
                     )
                     
-                    total_tokens = kv_cache.shape[1]
-                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    # Extract only actual tokens
+                    kv_cache = kv_cache[:, :total_tokens]
                     
                     # Pad if necessary
                     if total_tokens % block_size != 0:
@@ -506,12 +526,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
                     
                     logger.info(
-                        "[PREFILL] Re-packed KV cache (FlashAttention): "
-                        "num_gathered_blocks=%d, num_compact_blocks=%d, "
-                        "total_tokens=%d, final_shape=%s",
-                        num_gathered_blocks,
-                        num_compact_blocks,
-                        total_tokens,
+                        "[PREFILL] Re-packed KV cache (FlashAttention): final_shape=%s",
                         kv_cache.shape,
                     )
             
