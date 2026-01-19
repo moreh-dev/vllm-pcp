@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import regex as re
 import torch
 
+from vllm.distributed import (
+    get_up_group,
+    get_rp_group,
+)
+
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -130,6 +135,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             return
+        
+        logger.info("[DECODE] Starting start_load_kv")
 
         def inject_kv_into_layer(
             layer: torch.Tensor,
@@ -147,7 +154,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
               - FlashAttention: KV tensors are indexed along the second
                 dimension.
 
-            If the number of provided block IDs does not match the number of KV
+            if the number of provided block IDs does not match the number of KV
             blocks, only the overlapping portion is updated, and a warning is
             logged.
 
@@ -160,6 +167,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
+            logger.info(
+                "[DECODE] Injecting KV cache: request=%s, "
+                "kv_cache.shape=%s, layer.shape=%s, num_blocks=%d, block_ids=%s",
+                request_id,
+                kv_cache.shape,
+                layer.shape,
+                len(block_ids),
+                block_ids.tolist() if hasattr(block_ids, 'tolist') else block_ids,
+            )
+            
             if (
                 isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
             ):  # MLA or FlashInfer
@@ -167,10 +184,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 self.check_tensors_except_dim(layer, kv_cache, 0)
                 if len(block_ids) == num_block:
                     layer[block_ids, ...] = kv_cache
+                    logger.info(
+                        "[DECODE] Injected KV cache successfully (MLA/FlashInfer): "
+                        "request=%s, num_blocks=%d",
+                        request_id,
+                        num_block,
+                    )
                 else:
                     layer[block_ids[:num_block], ...] = kv_cache
                     logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
+                        "🚧[DECODE] kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
                         len(block_ids),
                         num_block,
@@ -182,10 +205,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 self.check_tensors_except_dim(layer, kv_cache, 1)
                 if len(block_ids) == num_block:
                     layer[:, block_ids, ...] = kv_cache
+                    logger.info(
+                        "[DECODE] Injected KV cache successfully (FlashAttention): "
+                        "request=%s, num_blocks=%d",
+                        request_id,
+                        num_block,
+                    )
                 else:
                     layer[:, block_ids[:num_block], ...] = kv_cache
                     logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
+                        "🚧[DECODE] kv_cache does not match, block_ids:%d, "
                         "num_block:%d, request_id:%s",
                         len(block_ids),
                         num_block,
@@ -198,6 +227,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         if metadata is None:
             return
+        
+        logger.info(
+            "[DECODE] Loading KV cache for %d requests",
+            len(metadata.requests),
+        )
 
         # Load the KV for each request each layer
         for request in metadata.requests:
@@ -216,13 +250,30 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                 layer = kv_cache[forward_context.virtual_engine]
 
+                logger.info(
+                    "[DECODE] Requesting KV cache: request=%s, layer=%s",
+                    request.request_id,
+                    layer_name,
+                )
+                
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
                     request.request_id + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
+                    logger.warning(
+                        "🚧[DECODE] kv_cache is None for request=%s, layer=%s",
+                        request.request_id,
+                        layer_name,
+                    )
                     continue
+                
+                logger.info(
+                    "[DECODE] Received KV cache: request=%s, layer=%s, shape=%s",
+                    request.request_id,
+                    layer_name,
+                    kv_cache.shape,
+                )
 
                 inject_kv_into_layer(
                     layer, kv_cache, request.block_ids, request.request_id
@@ -262,6 +313,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         assert self.p2p_nccl_engine is not None
+        
+        logger.info(
+            "[PREFILL] Starting save_kv_layer for layer=%s, "
+            "kv_layer.shape=%s",
+            layer_name,
+            kv_layer.shape,
+        )
 
         def extract_kv_from_layer(
             layer: torch.Tensor,
@@ -296,12 +354,191 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
+        
+        # Detect sequence parallelism mode
+        rp_world_size = get_rp_group().world_size
+        up_world_size = get_up_group().world_size
+        sp_enabled = rp_world_size > 1 or up_world_size > 1
+        
+        if sp_enabled:
+            logger.info(
+                "[PREFILL] Sequence parallelism enabled: "
+                "rp_world_size=%d, up_world_size=%d",
+                rp_world_size,
+                up_world_size,
+            )
+            # Determine which SP group to use for all-gather
+            if rp_world_size > 1:
+                sp_group = get_rp_group()
+            else:
+                sp_group = get_up_group()
+        
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            
+            logger.info(
+                "[PREFILL] Extracted KV cache for request=%s, layer=%s, "
+                "shape=%s, num_blocks=%d, block_ids=%s",
+                request_id,
+                layer_name,
+                kv_cache.shape,
+                len(request.block_ids),
+                request.block_ids.tolist() if hasattr(request.block_ids, 'tolist') else request.block_ids,
+            )
+            
+            # If sequence parallelism is enabled, gather full KV cache from all ranks
+            if sp_enabled:
+                # Each rank has a shard of the sequence dimension (dim=0 for MLA)
+                # Perform all-gather to collect the full KV cache
+                pre_gather_shape = kv_cache.shape
+                kv_cache = sp_group.all_gather(kv_cache, dim=0)
+                logger.info(
+                    "[PREFILL] All-gathered KV cache: "
+                    "pre_gather_shape=%s, post_gather_shape=%s",
+                    pre_gather_shape,
+                    kv_cache.shape,
+                )
+                
+                # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
+                # We need to consolidate them into compact blocks.
+                # 
+                # Example with 2 ranks, block_size=8, 4 tokens total:
+                #   Before: [[T0,T1,_,_,_,_,_,_], [T2,T3,_,_,_,_,_,_]]  (2 blocks, 4 tokens total)
+                #   After:  [[T0,T1,T2,T3,_,_,_,_]]                     (1 block, 4 tokens total)
+                #
+                # For FlashInfer format: [num_blocks, 2, num_heads, block_size, head_dim]
+                if isinstance(attn_metadata, MLACommonMetadata) or kv_cache.shape[1] == 2:
+                    # FlashInfer/MLA format
+                    num_gathered_blocks = kv_cache.shape[0]
+                    block_size = kv_cache.shape[3]
+                    
+                    # Get the actual number of tokens from request metadata
+                    # NOT the total number of block slots
+                    total_tokens = request.num_tokens
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    logger.info(
+                        "[PREFILL] Re-packing KV cache: "
+                        "num_gathered_blocks=%d, total_tokens=%d, "
+                        "num_compact_blocks=%d, block_size=%d",
+                        num_gathered_blocks,
+                        total_tokens,
+                        num_compact_blocks,
+                        block_size,
+                    )
+                    
+                    # Reshape to merge all blocks along the sequence dimension
+                    # [num_blocks, 2, num_heads, block_size, head_dim] 
+                    # -> [num_blocks * block_size, 2, num_heads, head_dim]
+                    kv_cache = kv_cache.reshape(
+                        num_gathered_blocks * block_size, 
+                        kv_cache.shape[1],  # 2 (K and V)
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[4],  # head_dim
+                    )
+                    
+                    # Extract only the actual tokens (not the empty padding slots)
+                    kv_cache = kv_cache[:total_tokens]
+                    
+                    # Pad to make it divisible by block_size
+                    if total_tokens % block_size != 0:
+                        padding_size = num_compact_blocks * block_size - total_tokens
+                        padding = torch.zeros(
+                            padding_size,
+                            kv_cache.shape[1],
+                            kv_cache.shape[2],
+                            kv_cache.shape[3],
+                            dtype=kv_cache.dtype,
+                            device=kv_cache.device,
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=0)
+                    
+                    # Reshape into compact blocks
+                    kv_cache = kv_cache.reshape(
+                        num_compact_blocks,
+                        block_size,
+                        kv_cache.shape[1],  # 2 (K and V)
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[3],  # head_dim
+                    ).permute(0, 2, 3, 1, 4).contiguous()
+                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
+                    
+                    logger.info(
+                        "[PREFILL] Re-packed KV cache: final_shape=%s",
+                        kv_cache.shape,
+                    )
+                    
+                elif kv_cache.shape[0] == 2:
+                    # FlashAttention format: [2, num_blocks, num_heads, block_size, head_dim]
+                    num_gathered_blocks = kv_cache.shape[1]
+                    block_size = kv_cache.shape[3]
+                    
+                    # Get the actual number of tokens
+                    total_tokens = request.num_tokens
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    logger.info(
+                        "[PREFILL] Re-packing KV cache (FlashAttention): "
+                        "num_gathered_blocks=%d, total_tokens=%d, "
+                        "num_compact_blocks=%d, block_size=%d",
+                        num_gathered_blocks,
+                        total_tokens,
+                        num_compact_blocks,
+                        block_size,
+                    )
+                    
+                    # Reshape to merge blocks: [2, num_blocks * block_size, num_heads, head_dim]
+                    kv_cache = kv_cache.reshape(
+                        2,  # K and V
+                        num_gathered_blocks * block_size,
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[4],  # head_dim
+                    )
+                    
+                    # Extract only actual tokens
+                    kv_cache = kv_cache[:, :total_tokens]
+                    
+                    # Pad if necessary
+                    if total_tokens % block_size != 0:
+                        padding_size = num_compact_blocks * block_size - total_tokens
+                        padding = torch.zeros(
+                            2,
+                            padding_size,
+                            kv_cache.shape[2],
+                            kv_cache.shape[3],
+                            dtype=kv_cache.dtype,
+                            device=kv_cache.device,
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=1)
+                    
+                    # Reshape into compact blocks
+                    kv_cache = kv_cache.reshape(
+                        2,
+                        num_compact_blocks,
+                        block_size,
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[3],  # head_dim
+                    ).permute(1, 0, 3, 2, 4).contiguous()
+                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
+                    
+                    logger.info(
+                        "[PREFILL] Re-packed KV cache (FlashAttention): final_shape=%s",
+                        kv_cache.shape,
+                    )
+            
+            logger.info(
+                "[PREFILL] Sending KV cache: request=%s, layer=%s, "
+                "shape=%s, remote_address=%s",
+                request_id,
+                layer_name,
+                kv_cache.shape,
+                remote_address,
+            )
+            
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
@@ -309,7 +546,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
+            logger.info("[PREFILL] Waiting for all KV cache sends to complete...")
             self.p2p_nccl_engine.wait_for_sent()
+            logger.info("[PREFILL] All KV cache sends completed")
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any
