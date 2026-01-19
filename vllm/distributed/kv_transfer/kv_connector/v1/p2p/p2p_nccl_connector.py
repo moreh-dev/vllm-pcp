@@ -164,11 +164,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
             """
             logger.info(
                 "[DECODE] Injecting KV cache: request=%s, "
-                "kv_cache.shape=%s, layer.shape=%s, num_blocks=%d",
+                "kv_cache.shape=%s, layer.shape=%s, num_blocks=%d, block_ids=%s",
                 request_id,
                 kv_cache.shape,
                 layer.shape,
                 len(block_ids),
+                block_ids.tolist() if hasattr(block_ids, 'tolist') else block_ids,
             )
             
             if (
@@ -376,11 +377,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
             
             logger.info(
                 "[PREFILL] Extracted KV cache for request=%s, layer=%s, "
-                "shape=%s, num_blocks=%d",
+                "shape=%s, num_blocks=%d, block_ids=%s",
                 request_id,
                 layer_name,
                 kv_cache.shape,
                 len(request.block_ids),
+                request.block_ids.tolist() if hasattr(request.block_ids, 'tolist') else request.block_ids,
             )
             
             # If sequence parallelism is enabled, gather full KV cache from all ranks
@@ -395,6 +397,118 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     pre_gather_shape,
                     kv_cache.shape,
                 )
+                
+                # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
+                # We need to consolidate them into compact blocks.
+                # 
+                # Example with 2 ranks, block_size=8:
+                #   Before: [[T0,T1,_,_,_,_,_,_], [T2,T3,_,_,_,_,_,_]]  (2 blocks, 4 tokens total)
+                #   After:  [[T0,T1,T2,T3,_,_,_,_]]                     (1 block, 4 tokens total)
+                #
+                # For FlashInfer format: [num_blocks, 2, num_heads, block_size, head_dim]
+                if isinstance(attn_metadata, MLACommonMetadata) or kv_cache.shape[1] == 2:
+                    # FlashInfer/MLA format
+                    num_gathered_blocks = kv_cache.shape[0]
+                    block_size = kv_cache.shape[3]
+                    
+                    # Reshape to merge all blocks along the sequence dimension
+                    # [num_blocks, 2, num_heads, block_size, head_dim] 
+                    # -> [num_blocks * block_size, 2, num_heads, head_dim]
+                    kv_cache = kv_cache.reshape(
+                        num_gathered_blocks * block_size, 
+                        kv_cache.shape[1],  # 2 (K and V)
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[4],  # head_dim
+                    )
+                    
+                    # Now reshape back into compact blocks
+                    # [total_tokens, 2, num_heads, head_dim]
+                    # -> [num_compact_blocks, block_size, 2, num_heads, head_dim]
+                    # -> [num_compact_blocks, 2, num_heads, block_size, head_dim]
+                    total_tokens = kv_cache.shape[0]
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    # Pad to make it divisible by block_size
+                    if total_tokens % block_size != 0:
+                        padding_size = num_compact_blocks * block_size - total_tokens
+                        padding = torch.zeros(
+                            padding_size,
+                            kv_cache.shape[1],
+                            kv_cache.shape[2],
+                            kv_cache.shape[3],
+                            dtype=kv_cache.dtype,
+                            device=kv_cache.device,
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=0)
+                    
+                    # Reshape into compact blocks
+                    kv_cache = kv_cache.reshape(
+                        num_compact_blocks,
+                        block_size,
+                        kv_cache.shape[1],  # 2 (K and V)
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[3],  # head_dim
+                    ).permute(0, 2, 3, 1, 4).contiguous()
+                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
+                    
+                    logger.info(
+                        "[PREFILL] Re-packed KV cache: "
+                        "num_gathered_blocks=%d, num_compact_blocks=%d, "
+                        "total_tokens=%d, final_shape=%s",
+                        num_gathered_blocks,
+                        num_compact_blocks,
+                        total_tokens,
+                        kv_cache.shape,
+                    )
+                    
+                elif kv_cache.shape[0] == 2:
+                    # FlashAttention format: [2, num_blocks, num_heads, block_size, head_dim]
+                    num_gathered_blocks = kv_cache.shape[1]
+                    block_size = kv_cache.shape[3]
+                    
+                    # Reshape to merge blocks: [2, num_blocks * block_size, num_heads, head_dim]
+                    kv_cache = kv_cache.reshape(
+                        2,  # K and V
+                        num_gathered_blocks * block_size,
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[4],  # head_dim
+                    )
+                    
+                    total_tokens = kv_cache.shape[1]
+                    num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                    
+                    # Pad if necessary
+                    if total_tokens % block_size != 0:
+                        padding_size = num_compact_blocks * block_size - total_tokens
+                        padding = torch.zeros(
+                            2,
+                            padding_size,
+                            kv_cache.shape[2],
+                            kv_cache.shape[3],
+                            dtype=kv_cache.dtype,
+                            device=kv_cache.device,
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=1)
+                    
+                    # Reshape into compact blocks
+                    kv_cache = kv_cache.reshape(
+                        2,
+                        num_compact_blocks,
+                        block_size,
+                        kv_cache.shape[2],  # num_heads
+                        kv_cache.shape[3],  # head_dim
+                    ).permute(1, 0, 3, 2, 4).contiguous()
+                    # Now: [num_compact_blocks, 2, num_heads, block_size, head_dim]
+                    
+                    logger.info(
+                        "[PREFILL] Re-packed KV cache (FlashAttention): "
+                        "num_gathered_blocks=%d, num_compact_blocks=%d, "
+                        "total_tokens=%d, final_shape=%s",
+                        num_gathered_blocks,
+                        num_compact_blocks,
+                        total_tokens,
+                        kv_cache.shape,
+                    )
             
             logger.info(
                 "[PREFILL] Sending KV cache: request=%s, layer=%s, "
