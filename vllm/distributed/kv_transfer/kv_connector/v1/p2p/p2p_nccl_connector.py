@@ -423,6 +423,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 tokens_per_rank = total_tokens // sp_size
                 remainder = total_tokens % sp_size
                 
+                logger.info(
+                    f"[DEBUG] total_tokens={total_tokens} sp_size={sp_size} "
+                    f"tokens_per_rank={tokens_per_rank} remainder={remainder} "
+                    f"block_size={block_size} num_compact_blocks={num_compact_blocks}"
+                )
+
                 all_rank_tokens = []
                 for i in range(sp_size):
                     this_rank_tokens = tokens_per_rank + (1 if i < remainder else 0)
@@ -437,6 +443,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # Permute to make blocks and block_size adjacent: [2, num_blocks, block_size, num_heads, head_dim]
                         # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
                         rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
+                        # Take actual tokens for this rank
+                        all_rank_tokens.append(rank_flat[:, :this_rank_tokens])
                     else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
@@ -448,6 +456,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # Take actual tokens for this rank
                         all_rank_tokens.append(rank_flat[:this_rank_tokens])
                 
+                logger.info(f"[DEBUG] len(all_rank_tokens)={len(all_rank_tokens)}")
+
                 # Concatenate actual tokens from all ranks
                 if kv_cache.shape[0] == 2:
                     kv_cache = torch.cat(all_rank_tokens, dim=1) # dim 1 is sequence for FA
