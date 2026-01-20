@@ -328,6 +328,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
             kv_layer.shape,
         )
 
+        # Detect layout type once
+        is_mla_or_fi = (
+            isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+        )
+
         def extract_kv_from_layer(
             layer: torch.Tensor,
             block_ids: torch.Tensor,
@@ -349,9 +354,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 torch.Tensor: A tensor containing the extracted KV slices.
                 Returns None if the layout is unsupported.
             """
-            if (
-                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-            ):  # MLA or FlashInfer
+            if is_mla_or_fi:  # MLA or FlashInfer
                 return layer[block_ids, ...]
 
             if layer.shape[0] == 2:  # FlashAttention
@@ -400,14 +403,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
             
             # If sequence parallelism is enabled, gather full KV cache from all ranks
             if sp_enabled:
-                num_blocks_per_rank = kv_cache.shape[1 if kv_cache.shape[0] == 2 else 0]
+                num_blocks_per_rank = kv_cache.shape[0 if is_mla_or_fi else 1]
                 
                 # Each rank has a shard of the sequence dimension
                 # Perform all-gather to collect the full KV cache
                 pre_gather_shape = kv_cache.shape
                 # dim 1 is sequence for FlashAttention [2, num_blocks, ...], 
                 # dim 0 for MLA/FlashInfer [num_blocks, 2, ...]
-                gather_dim = 1 if kv_cache.shape[0] == 2 else 0
+                gather_dim = 0 if is_mla_or_fi else 1
                 kv_cache = sp_group.all_gather(kv_cache, dim=gather_dim)
                 
                 logger.info(
@@ -430,19 +433,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 tokens_per_rank = total_tokens // sp_size
                 remainder = total_tokens % sp_size
                 
-                logger.info(
-                    f"[DEBUG] total_tokens={total_tokens} sp_size={sp_size} "
-                    f"tokens_per_rank={tokens_per_rank} remainder={remainder} "
-                    f"block_size={block_size} num_compact_blocks={num_compact_blocks}"
-                )
-
                 all_rank_tokens = []
                 for i in range(sp_size):
                     this_rank_tokens = tokens_per_rank + (1 if i < remainder else 0)
                     if this_rank_tokens == 0:
                         continue
                     
-                    if kv_cache.shape[0] == 2: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
+                    if not is_mla_or_fi: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[:, i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
                         # Shape: [2, num_blocks, num_heads, block_size, head_dim]
@@ -463,19 +460,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # Take actual tokens for this rank
                         all_rank_tokens.append(rank_flat[:this_rank_tokens])
                 
-                logger.info(f"[DEBUG] len(all_rank_tokens)={len(all_rank_tokens)}")
-
                 # Concatenate actual tokens from all ranks
-                if kv_cache.shape[0] == 2:
+                if not is_mla_or_fi:
                     kv_cache = torch.cat(all_rank_tokens, dim=1) # dim 1 is sequence for FA
                 else:
                     kv_cache = torch.cat(all_rank_tokens, dim=0) # dim 0 is sequence for MLA
                 
                 # Pad to make it divisible by block_size
-                current_tokens = kv_cache.shape[1 if kv_cache.shape[0] == 2 else 0]
+                current_tokens = kv_cache.shape[1 if not is_mla_or_fi else 0]
                 if current_tokens < num_compact_blocks * block_size:
                     padding_size = num_compact_blocks * block_size - current_tokens
-                    if kv_cache.shape[0] == 2:
+                    if not is_mla_or_fi:
                         padding = torch.zeros(
                             2, padding_size, kv_cache.shape[2], kv_cache.shape[3], 
                             dtype=kv_cache.dtype, device=kv_cache.device
@@ -489,7 +484,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         kv_cache = torch.cat([kv_cache, padding], dim=0)
                 
                 # Reshape into compact blocks
-                if kv_cache.shape[0] == 2: # FA
+                if not is_mla_or_fi: # FA
                     kv_cache = kv_cache.reshape(
                         2, num_compact_blocks, block_size, kv_cache.shape[2], kv_cache.shape[3]
                     ).permute(0, 1, 3, 2, 4).contiguous()
