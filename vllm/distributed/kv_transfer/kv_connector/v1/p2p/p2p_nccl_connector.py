@@ -409,7 +409,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
                         # Take actual tokens for this rank
                         all_rank_tokens.append(rank_flat[:, :this_rank_elements])
-                    else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
+                    elif len(kv_cache.shape) == 3: # MLA 3D: [num_blocks, block_size, dim]
+                         rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                         # Shape: [num_blocks, block_size, dim]
+                         # Flatten into tokens: [num_blocks * block_size, dim]
+                         rank_flat = rank_blocks.flatten(0, 1)
+                         all_rank_tokens.append(rank_flat[:this_rank_elements])
+                    else: # MLA/FlashInfer 4D+: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
                         # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
@@ -437,8 +443,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         )
                         kv_cache = torch.cat([kv_cache, padding], dim=1)
                     else:
+                        # For MLA, we might be 2D (flattened [total_elements, dim])
+                        # Need to construct padding that matches
+                        curr_shape = list(kv_cache.shape)
+                        curr_shape[0] = padding_size
                         padding = torch.zeros(
-                            padding_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3], 
+                            curr_shape, 
                             dtype=kv_cache.dtype, device=kv_cache.device
                         )
                         kv_cache = torch.cat([kv_cache, padding], dim=0)
@@ -448,7 +458,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     kv_cache = kv_cache.reshape(
                         2, num_compact_blocks, effective_block_size, kv_cache.shape[2], kv_cache.shape[3]
                     ).permute(0, 1, 3, 2, 4).contiguous()
-                else: # MLA
+                elif len(kv_cache.shape) == 2: # MLA 3D flattened -> [total_elements, dim]
+                    # Reshape back to [num_blocks, block_size, dim]
+                    kv_cache = kv_cache.reshape(
+                        num_compact_blocks, effective_block_size, kv_cache.shape[1]
+                    ).contiguous()
+                else: # MLA 4D+
                     kv_cache = kv_cache.reshape(
                         num_compact_blocks, effective_block_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
                     ).permute(0, 2, 3, 1, 4).contiguous()
