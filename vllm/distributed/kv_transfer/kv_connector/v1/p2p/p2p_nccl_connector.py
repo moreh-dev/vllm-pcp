@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import regex as re
 import torch
+import math
+
+from vllm.distributed import (
+    get_up_group,
+    get_rp_group,
+)
 
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import VllmConfig
@@ -263,6 +269,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         assert self.p2p_nccl_engine is not None
 
+        # Detect layout type once
+        is_mla_or_fi = (
+            isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+        )
+
         def extract_kv_from_layer(
             layer: torch.Tensor,
             block_ids: torch.Tensor,
@@ -284,9 +295,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 torch.Tensor: A tensor containing the extracted KV slices.
                 Returns None if the layout is unsupported.
             """
-            if (
-                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-            ):  # MLA or FlashInfer
+            if is_mla_or_fi:  # MLA or FlashInfer
                 return layer[block_ids, ...]
 
             if layer.shape[0] == 2:  # FlashAttention
@@ -296,15 +305,126 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
+        
+        # Detect sequence parallelism mode
+        rp_world_size = get_rp_group().world_size
+        up_world_size = get_up_group().world_size
+        sp_enabled = rp_world_size > 1 or up_world_size > 1
+        sp_group = None
+        
+        if sp_enabled:
+            # Determine which SP group to use for all-gather
+            if rp_world_size > 1:
+                sp_group = get_rp_group()
+            else:
+                sp_group = get_up_group()
+        
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
-            )
+            
+            
+            # If sequence parallelism is enabled, gather full KV cache from all ranks
+            if sp_enabled:
+                num_blocks_per_rank = kv_cache.shape[0 if is_mla_or_fi else 1]
+                
+                # Each rank has a shard of the sequence dimension
+                # Perform all-gather to collect the full KV cache
+                pre_gather_shape = kv_cache.shape
+                # dim 1 is sequence for FlashAttention [2, num_blocks, ...], 
+                # dim 0 for MLA/FlashInfer [num_blocks, 2, ...]
+                gather_dim = 0 if is_mla_or_fi else 1
+                kv_cache = sp_group.all_gather(kv_cache, dim=gather_dim)
+                
+                # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
+                # We need to extract the actual tokens from each rank's blocks and concatenate them.
+                # This is because each rank's last block might be partially filled.
+                
+                # Handling mismatch between config block_size and tensor block dim (e.g. MLA)
+                tensor_block_dim = kv_layer.shape[3]
+                element_scale = tensor_block_dim / self._block_size
+                
+                # Convert "tokens" to "tensor elements"
+                total_elements = math.ceil(request.num_tokens * element_scale)
+                effective_block_size = tensor_block_dim
+                
+                num_compact_blocks = (total_elements + effective_block_size - 1) // effective_block_size
+                
+                sp_size = sp_group.world_size
+                elements_per_rank = total_elements // sp_size
+                remainder = total_elements % sp_size
+
+                all_rank_tokens = []
+                for i in range(sp_size):
+                    this_rank_elements = elements_per_rank + (1 if i < remainder else 0)
+                    if this_rank_elements == 0:
+                        continue
+                    
+                    if not is_mla_or_fi: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
+                        # Extract this rank's blocks
+                        rank_blocks = kv_cache[:, i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                        # Shape: [2, num_blocks, num_heads, block_size, head_dim]
+                        
+                        # Permute to make blocks and block_size adjacent: [2, num_blocks, block_size, num_heads, head_dim]
+                        # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
+                        rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
+                        # Take actual tokens for this rank
+                        all_rank_tokens.append(rank_flat[:, :this_rank_elements])
+                    else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
+                        # Extract this rank's blocks
+                        rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                        # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
+                        
+                        # Permute to make blocks and block_size adjacent: [num_blocks, block_size, 2, num_heads, head_dim]
+                        # Then flatten into tokens: [num_blocks * block_size, 2, num_heads, head_dim]
+                        rank_flat = rank_blocks.permute(0, 3, 1, 2, 4).flatten(0, 1)
+                        # Take actual tokens for this rank
+                        all_rank_tokens.append(rank_flat[:this_rank_elements])
+                
+                # Concatenate actual tokens from all ranks
+                if not is_mla_or_fi:
+                    kv_cache = torch.cat(all_rank_tokens, dim=1) # dim 1 is sequence for FA
+                else:
+                    kv_cache = torch.cat(all_rank_tokens, dim=0) # dim 0 is sequence for MLA
+                
+                # Pad to make it divisible by block_size
+                current_elements = kv_cache.shape[1 if not is_mla_or_fi else 0]
+                if current_elements < num_compact_blocks * effective_block_size:
+                    padding_size = num_compact_blocks * effective_block_size - current_elements
+                    if not is_mla_or_fi:
+                        padding = torch.zeros(
+                            2, padding_size, kv_cache.shape[2], kv_cache.shape[3], 
+                            dtype=kv_cache.dtype, device=kv_cache.device
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=1)
+                    else:
+                        padding = torch.zeros(
+                            padding_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3], 
+                            dtype=kv_cache.dtype, device=kv_cache.device
+                        )
+                        kv_cache = torch.cat([kv_cache, padding], dim=0)
+                
+                # Reshape into compact blocks
+                if not is_mla_or_fi: # FA
+                    kv_cache = kv_cache.reshape(
+                        2, num_compact_blocks, effective_block_size, kv_cache.shape[2], kv_cache.shape[3]
+                    ).permute(0, 1, 3, 2, 4).contiguous()
+                else: # MLA
+                    kv_cache = kv_cache.reshape(
+                        num_compact_blocks, effective_block_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
+                    ).permute(0, 2, 3, 1, 4).contiguous()
+
+            
+            # Now send. In sequence parallelism mode, all ranks gathered the same KV cache.
+            # Only the first rank in SP group should send it to the decode node
+            # to avoid redundant sends and potential hangs.
+            if not sp_enabled or sp_group.rank_in_group == 0:
+                self.p2p_nccl_engine.send_tensor(
+                    request_id + "#" + layer_name, kv_cache, remote_address
+                )
 
     def wait_for_save(self):
         if self.is_producer:
