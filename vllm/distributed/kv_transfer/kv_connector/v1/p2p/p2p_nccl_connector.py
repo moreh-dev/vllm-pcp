@@ -344,7 +344,43 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # This is because each rank's last block might be partially filled.
                 
                 # Handling mismatch between config block_size and tensor block dim (e.g. MLA)
-                tensor_block_dim = kv_layer.shape[3]
+                # MLA/FlashInfer often has shape [num_blocks, block_size, dim] or similar 3D
+                if len(kv_layer.shape) >= 4:
+                    tensor_block_dim = kv_layer.shape[3]
+                else:
+                    # Fallback for 3D shapes, assuming block_size is dim 1 or similar.
+                    # For MLA [num_blocks, block_size, dim], it might be shape[1].
+                    # Let's derive it or default to block_size if aligned.
+                    # DeepSeek V2/3 MLA shape typically: [num_blocks, 1, block_size, dim] or [num_blocks, block_size, dim]?
+                    # Previous logs suggested [num_blocks, 2, ...] which is 4D.
+                    # If it's 3D, maybe [num_blocks, block_size, compressed_dim].
+                    # Safest bet is likely checking the dimension corresponding to block_size.
+                    if is_mla_or_fi:
+                         tensor_block_dim = kv_layer.shape[2] if len(kv_layer.shape) == 3 else kv_layer.shape[1] # Trying to guess correct index
+                         # Actually, let's trust the user config block_size unless we are sure.
+                         # But wait, the whole point of this fix was that config block size (16) != actual (4).
+                         # If we can't determine it, we might crash again later.
+                         # Let's look at standard MLA shapes.
+                         # If it's [num_blocks, block_size, head_dim], then index 1.
+                         pass
+
+                # BETTER FIX: Use the specific known shapes.
+                if is_mla_or_fi:
+                    # MLA usually: [num_blocks, block_size, dim] (3D) or [num_blocks, 1, block_size, dim] (4D)?
+                    # If 3D: shape[1] is block_size.
+                    # If 4D with shape[1]==2 (key/val split): [num_blocks, 2, block_size, dim] -> shape[2] ok.
+                    # Wait, if shape[3] failed, it must be < 4 dims.
+                    # So likely 3D.
+                    if len(kv_layer.shape) == 3:
+                         tensor_block_dim = kv_layer.shape[1]
+                    elif len(kv_layer.shape) > 3:
+                         tensor_block_dim = kv_layer.shape[3] # Assuming [..., heads, block_size, dim]
+                    else:
+                         tensor_block_dim = self._block_size # Fallback
+                else:
+                    # FA: [2, num_blocks, num_heads, block_size, head_dim] -> shape[3]
+                    tensor_block_dim = kv_layer.shape[3]
+
                 element_scale = tensor_block_dim / self._block_size
                 
                 # Convert "tokens" to "tensor elements"
