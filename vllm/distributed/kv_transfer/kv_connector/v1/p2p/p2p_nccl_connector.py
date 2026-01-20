@@ -436,14 +436,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         
                         # Permute to make blocks and block_size adjacent: [2, num_blocks, block_size, num_heads, head_dim]
                         # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
-                        rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).reshape(
-                            2, 
-                            num_blocks_per_rank * block_size, 
-                            kv_cache.shape[2], 
-                            kv_cache.shape[4]
-                        )
-                        # Take actual tokens for this rank
-                        all_rank_tokens.append(rank_flat[:, :this_rank_tokens])
+                        rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
                     else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
@@ -451,12 +444,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         
                         # Permute to make blocks and block_size adjacent: [num_blocks, block_size, 2, num_heads, head_dim]
                         # Then flatten into tokens: [num_blocks * block_size, 2, num_heads, head_dim]
-                        rank_flat = rank_blocks.permute(0, 3, 1, 2, 4).reshape(
-                            num_blocks_per_rank * block_size, 
-                            kv_cache.shape[1], 
-                            kv_cache.shape[2], 
-                            kv_cache.shape[4]
-                        )
+                        rank_flat = rank_blocks.permute(0, 3, 1, 2, 4).flatten(0, 1)
                         # Take actual tokens for this rank
                         all_rank_tokens.append(rank_flat[:this_rank_tokens])
                 
