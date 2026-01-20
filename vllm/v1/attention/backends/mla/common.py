@@ -2017,7 +2017,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        v = v.contiguous()
 
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 

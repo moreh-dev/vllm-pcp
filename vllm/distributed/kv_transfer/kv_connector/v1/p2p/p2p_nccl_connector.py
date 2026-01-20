@@ -230,6 +230,18 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
                     continue
 
+                # DEBUG: Dump the received tensor
+                try:
+                    import os
+                    dump_dir = "/tmp/kv_dump"
+                    os.makedirs(dump_dir, exist_ok=True)
+                    if "layer_0" in layer_name:
+                        dump_path = f"{dump_dir}/decode_rank{self._rank}_{layer_name}.pt"
+                        torch.save(kv_cache, dump_path)
+                        logger.info(f"JW_DBG: Saved decode tensor to {dump_path}, shape={kv_cache.shape}")
+                except Exception as e:
+                    logger.warning(f"JW_DBG: Failed to save decode tensor: {e}")
+
                 inject_kv_into_layer(
                     layer, kv_cache, request.block_ids, request.request_id
                 )
@@ -480,6 +492,19 @@ class P2pNcclConnector(KVConnectorBase_V1):
             # Only the first rank in SP group should send it to the decode node
             # to avoid redundant sends and potential hangs.
             if not sp_enabled or sp_group.rank_in_group == 0:
+                # DEBUG: Dump the tensor
+                try:
+                    import os
+                    dump_dir = "/tmp/kv_dump"
+                    os.makedirs(dump_dir, exist_ok=True)
+                    # Limit dump to avoid filling disk, e.g. first layer only
+                    if "layer_0" in layer_name: 
+                        dump_path = f"{dump_dir}/prefill_rank{self._rank}_{layer_name}.pt"
+                        torch.save(kv_cache, dump_path)
+                        logger.info(f"JW_DBG: Saved prefill tensor to {dump_path}, shape={kv_cache.shape}")
+                except Exception as e:
+                    logger.warning(f"JW_DBG: Failed to save prefill tensor: {e}")
+
                 self.p2p_nccl_engine.send_tensor(
                     request_id + "#" + layer_name, kv_cache, remote_address
                 )
