@@ -325,6 +325,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            print ('jw_dbg: initial kv_cache.shape', kv_cache.shape, flush=True)
             
             
             # If sequence parallelism is enabled, gather full KV cache from all ranks
@@ -337,7 +338,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # dim 1 is sequence for FlashAttention [2, num_blocks, ...], 
                 # dim 0 for MLA/FlashInfer [num_blocks, 2, ...]
                 gather_dim = 0 if is_mla_or_fi else 1
+                print (f'jw_dbg: before all_gather: {kv_cache.shape}', flush=True)
                 kv_cache = sp_group.all_gather(kv_cache, dim=gather_dim)
+                print (f'jw_dbg: after all_gather: {kv_cache.shape}', flush=True)
                 
                 # Re-pack: After all-gather, we have multiple sparse blocks from different ranks.
                 # We need to extract the actual tokens from each rank's blocks and concatenate them.
@@ -402,11 +405,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     if not is_mla_or_fi: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[:, i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
+                        print (f'jw_dbg, for rank {i}, rank_blocks.shape: {rank_blocks.shape}', flush=True)
                         # Shape: [2, num_blocks, num_heads, block_size, head_dim]
                         
                         # Permute to make blocks and block_size adjacent: [2, num_blocks, block_size, num_heads, head_dim]
                         # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
                         rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
+                        print (f'jw_dbg, for rank {i}, rank_flat.shape: {rank_flat.shape}', flush=True)
                         # Take actual tokens for this rank
                         all_rank_tokens.append(rank_flat[:, :this_rank_elements])
                     elif len(kv_cache.shape) == 3: # MLA 3D: [num_blocks, block_size, dim]
@@ -431,6 +436,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     kv_cache = torch.cat(all_rank_tokens, dim=1) # dim 1 is sequence for FA
                 else:
                     kv_cache = torch.cat(all_rank_tokens, dim=0) # dim 0 is sequence for MLA
+
+                print (f'jw_dbg, after cat, kv_cache.shape: {kv_cache.shape}', flush=True)
                 
                 # Pad to make it divisible by block_size
                 current_elements = kv_cache.shape[1 if not is_mla_or_fi else 0]
