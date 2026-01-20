@@ -181,7 +181,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
             ):  # MLA or FlashInfer
                 num_block = kv_cache.shape[0]
-                self.check_tensors_except_dim(layer, kv_cache, 0)
+                try:
+                    self.check_tensors_except_dim(layer, kv_cache, 0)
+                except NotImplementedError:
+                    logger.error(
+                        f"[DECODE] Shape mismatch! layer.shape={layer.shape} kv_cache.shape={kv_cache.shape} "
+                        f"dim=0"
+                    )
+                    raise
                 if len(block_ids) == num_block:
                     layer[block_ids, ...] = kv_cache
                     logger.info(
