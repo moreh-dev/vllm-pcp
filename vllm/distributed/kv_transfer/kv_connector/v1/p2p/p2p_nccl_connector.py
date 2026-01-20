@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import regex as re
 import torch
+import math
 
 from vllm.distributed import (
     get_up_group,
@@ -425,18 +426,30 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # We need to extract the actual tokens from each rank's blocks and concatenate them.
                 # This is because each rank's last block might be partially filled.
                 
-                total_tokens = request.num_tokens
-                block_size = self._block_size
-                num_compact_blocks = (total_tokens + block_size - 1) // block_size
+                # Handling mismatch between config block_size and tensor block dim (e.g. MLA)
+                tensor_block_dim = kv_layer.shape[3]
+                element_scale = tensor_block_dim / self._block_size
+                
+                # Convert "tokens" to "tensor elements"
+                total_elements = math.ceil(request.num_tokens * element_scale)
+                effective_block_size = tensor_block_dim
+                
+                num_compact_blocks = (total_elements + effective_block_size - 1) // effective_block_size
                 
                 sp_size = sp_group.world_size
-                tokens_per_rank = total_tokens // sp_size
-                remainder = total_tokens % sp_size
+                elements_per_rank = total_elements // sp_size
+                remainder = total_elements % sp_size
                 
+                logger.info(
+                    f"[DEBUG] total_tokens={request.num_tokens} total_elements={total_elements} "
+                    f"element_scale={element_scale} effective_block_size={effective_block_size} "
+                    f"num_compact_blocks={num_compact_blocks} sp_size={sp_size}"
+                )
+
                 all_rank_tokens = []
                 for i in range(sp_size):
-                    this_rank_tokens = tokens_per_rank + (1 if i < remainder else 0)
-                    if this_rank_tokens == 0:
+                    this_rank_elements = elements_per_rank + (1 if i < remainder else 0)
+                    if this_rank_elements == 0:
                         continue
                     
                     if not is_mla_or_fi: # FlashAttention: [2, num_gathered_blocks, num_heads, block_size, head_dim]
@@ -448,7 +461,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # Then flatten into tokens: [2, num_blocks * block_size, num_heads, head_dim]
                         rank_flat = rank_blocks.permute(0, 1, 3, 2, 4).flatten(1, 2)
                         # Take actual tokens for this rank
-                        all_rank_tokens.append(rank_flat[:, :this_rank_tokens])
+                        all_rank_tokens.append(rank_flat[:, :this_rank_elements])
                     else: # MLA/FlashInfer: [num_gathered_blocks, 2, num_heads, block_size, head_dim]
                         # Extract this rank's blocks
                         rank_blocks = kv_cache[i*num_blocks_per_rank : (i+1)*num_blocks_per_rank]
@@ -458,7 +471,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         # Then flatten into tokens: [num_blocks * block_size, 2, num_heads, head_dim]
                         rank_flat = rank_blocks.permute(0, 3, 1, 2, 4).flatten(0, 1)
                         # Take actual tokens for this rank
-                        all_rank_tokens.append(rank_flat[:this_rank_tokens])
+                        all_rank_tokens.append(rank_flat[:this_rank_elements])
                 
                 # Concatenate actual tokens from all ranks
                 if not is_mla_or_fi:
@@ -467,9 +480,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     kv_cache = torch.cat(all_rank_tokens, dim=0) # dim 0 is sequence for MLA
                 
                 # Pad to make it divisible by block_size
-                current_tokens = kv_cache.shape[1 if not is_mla_or_fi else 0]
-                if current_tokens < num_compact_blocks * block_size:
-                    padding_size = num_compact_blocks * block_size - current_tokens
+                current_elements = kv_cache.shape[1 if not is_mla_or_fi else 0]
+                if current_elements < num_compact_blocks * effective_block_size:
+                    padding_size = num_compact_blocks * effective_block_size - current_elements
                     if not is_mla_or_fi:
                         padding = torch.zeros(
                             2, padding_size, kv_cache.shape[2], kv_cache.shape[3], 
@@ -486,11 +499,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # Reshape into compact blocks
                 if not is_mla_or_fi: # FA
                     kv_cache = kv_cache.reshape(
-                        2, num_compact_blocks, block_size, kv_cache.shape[2], kv_cache.shape[3]
+                        2, num_compact_blocks, effective_block_size, kv_cache.shape[2], kv_cache.shape[3]
                     ).permute(0, 1, 3, 2, 4).contiguous()
                 else: # MLA
                     kv_cache = kv_cache.reshape(
-                        num_compact_blocks, block_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
+                        num_compact_blocks, effective_block_size, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
                     ).permute(0, 2, 3, 1, 4).contiguous()
 
                 logger.info(
