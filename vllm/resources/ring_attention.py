@@ -263,8 +263,7 @@ def moreh_gpt_attention(
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
-            with torch.cuda.stream(comm_stream):
-                comm.commit()
+            comm.commit()
 
         key, value = key_layer, value_layer
 
@@ -358,8 +357,7 @@ def _moreh_mla_ring_attention_balanced_full(
         if step + 1 != comm.world_size:
             next_kv_c: torch.Tensor = comm.send_recv(kv_c_normed_layer)
             next_k_pe: torch.Tensor = comm.send_recv(k_pe_layer)
-            with torch.cuda.stream(comm_stream):
-                comm.commit()
+            comm.commit()
 
         # Project KV
         # kv_c_normed_layer: [B, S, Lkv]
