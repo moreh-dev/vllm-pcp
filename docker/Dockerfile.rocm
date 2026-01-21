@@ -144,7 +144,8 @@ RUN git clone https://github.com/feifeibear/long-context-attention.git \
     && cd long-context-attention \
     && MAX_JOBS=$(nproc) pip install . \
     && pip install peft==0.17.0 \
-    && pip install xfuser
+    && pip install xfuser \
+    && pip install quart hypercorn blinker --ignore-installed
 
 ENV TOKENIZERS_PARALLELISM=false
 
