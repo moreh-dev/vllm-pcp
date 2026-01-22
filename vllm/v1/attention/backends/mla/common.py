@@ -241,7 +241,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from yunchang.globals import PROCESS_GROUP
 
-from resources.ring_attention import (
+from vllm.resources.ring_attention import (
     AttnType,
     RingComm,
     SeqAllToAll4D,
