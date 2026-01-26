@@ -170,6 +170,7 @@ def call_block_attn(
     # Padding for MLA where qk_head_dim != v_head_dim
     # q, k: [bs, seqlen, num_heads, qk_head_dim]
     # v: [bs, seqlen, num_heads, v_head_dim]
+    print (f'jw_dbg: call_block_attn value.shape before pad: {value.shape}, query.shape: {query.shape}')
     original_v_head_dim = value.shape[-1]
     if value.shape[-1] != query.shape[-1]:
         pad_len = query.shape[-1] - value.shape[-1]
@@ -349,8 +350,9 @@ def _moreh_gpt_attention_balanced_full(
     window_size = (-1, -1)
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(key_layer)
-            next_v: torch.Tensor = comm.send_recv(value_layer)
+            next_k: torch.Tensor = comm.send_recv(key_layer.contiguous())
+            next_v: torch.Tensor = comm.send_recv(value_layer.contiguous())
+            print (f'jw_dbg: issued comm at step {step}')
             comm.commit()
 
         key, value = key_layer, value_layer
