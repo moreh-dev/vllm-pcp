@@ -349,8 +349,8 @@ def _moreh_gpt_attention_balanced_full(
     window_size = (-1, -1)
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(key_layer)
-            next_v: torch.Tensor = comm.send_recv(value_layer)
+            next_k: torch.Tensor = comm.send_recv(key_layer.contiguous())
+            next_v: torch.Tensor = comm.send_recv(value_layer.contiguous())
             comm.commit()
 
         key, value = key_layer, value_layer

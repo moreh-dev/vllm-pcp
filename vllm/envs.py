@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_NIXL_ABORT_REQUEST_TIMEOUT: int = 480
+    VLLM_ENABLE_MULTI_RP_TRANSFER: bool = False
     VLLM_USE_CUDNN_PREFILL: bool = False
     VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL: bool = False
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1366,6 +1367,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disaggregated decode-prefill setup.
     "VLLM_NIXL_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_NIXL_ABORT_REQUEST_TIMEOUT", "480")
+    ),
+    # Enable multi-RP transfer mode where decoder connects to all prefill
+    # RP ranks instead of just rp_rank=0. This eliminates allgather overhead
+    # on prefill side.
+    "VLLM_ENABLE_MULTI_RP_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_MULTI_RP_TRANSFER", "0"))
     ),
     # Controls whether or not to use cudnn prefill
     "VLLM_USE_CUDNN_PREFILL": lambda: bool(
