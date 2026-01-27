@@ -483,9 +483,17 @@ class NixlConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
+
+                logger.info("[LISTENER] Received request from identity: %s", identity)
+
                 # Decode message: supports both 2-tuple (legacy) and 3-tuple (multi-RP)
                 # (GET_META_MSG, tp_rank) or (GET_META_MSG, tp_rank, rp_rank)
-                decoded = msgspec.msgpack.decode(msg)
+                try:
+                    decoded = msgspec.msgpack.decode(msg)
+                except Exception as e:
+                    logger.error("[LISTENER] Failed to decode message: %s", e)
+                    continue
+
                 if len(decoded) == 3:
                     # New format: (GET_META_MSG, tp_rank, rp_rank)
                     msg_type, target_tp_rank, target_rp_rank = decoded
@@ -494,38 +502,69 @@ class NixlConnectorScheduler:
                     msg_type, target_tp_rank = decoded
                     target_rp_rank = 0
                 else:
-                    logger.warning("Invalid message format: %s", decoded)
+                    logger.warning("[LISTENER] Invalid message format: %s", decoded)
                     continue
 
-                logger.debug(
-                    "Received message for TP rank %s, RP rank %s",
+                logger.info(
+                    "[LISTENER] Decoded request: type=%s, TP rank=%s, RP rank=%s",
+                    msg_type,
                     target_tp_rank,
                     target_rp_rank,
                 )
                 if msg_type != GET_META_MSG:
-                    logger.warning("Connection listener got unexpected message %s", msg_type)
+                    logger.warning("[LISTENER] Got unexpected message type: %s", msg_type)
                     continue
 
                 # Send response from 2D encoded_data structure
                 # Fallback to rp_rank=0 if requested rp_rank not available (legacy mode)
+                response_data = None
                 try:
                     response_data = encoded_data[target_tp_rank][target_rp_rank]
+                    logger.info(
+                        "[LISTENER] Found metadata for TP rank %s, RP rank %s (%d bytes)",
+                        target_tp_rank,
+                        target_rp_rank,
+                        len(response_data),
+                    )
                 except KeyError:
-                    logger.debug(
-                        "RP rank %s not found for TP rank %s, falling back to rp_rank=0",
+                    logger.info(
+                        "[LISTENER] RP rank %s not found for TP rank %s, falling back to rp_rank=0",
                         target_rp_rank,
                         target_tp_rank,
                     )
                     try:
                         response_data = encoded_data[target_tp_rank][0]
+                        logger.info(
+                            "[LISTENER] Using fallback metadata for TP rank %s (%d bytes)",
+                            target_tp_rank,
+                            len(response_data),
+                        )
                     except KeyError:
                         logger.error(
-                            "No metadata found for TP rank %s (requested RP rank %s)",
+                            "[LISTENER] No metadata found for TP rank %s (requested RP rank %s). "
+                            "Available TP ranks: %s",
                             target_tp_rank,
                             target_rp_rank,
+                            list(encoded_data.keys()),
                         )
-                        continue
+
+                # Always send a response to avoid client timeout
+                # If no data found, send empty bytes (client will handle error)
+                if response_data is None:
+                    logger.warning(
+                        "[LISTENER] Sending empty response for TP rank %s, RP rank %s",
+                        target_tp_rank,
+                        target_rp_rank,
+                    )
+                    response_data = b""
+
+                logger.info(
+                    "[LISTENER] Sending response to identity %s: %d bytes",
+                    identity,
+                    len(response_data),
+                )
                 sock.send_multipart((identity, b"", response_data))
+                logger.info("[LISTENER] Response sent successfully")
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -1081,89 +1120,141 @@ class NixlConnectorWorker:
 
         agents: dict[int, dict[int, str]] = defaultdict(dict)
 
+        # First handshake to get actual RP size from prefill
+        actual_remote_rp_size = remote_rp_size
+
         # Connect to all RP ranks for this TP rank
-        for rp_rank in range(remote_rp_size):
-            logger.debug(
-                "Querying metadata on path: %s for TP rank %s, RP rank %s",
+        for rp_rank in range(actual_remote_rp_size):
+            logger.info(
+                "[HANDSHAKE] Starting query for path: %s, TP rank %s, RP rank %s (loop iteration %d/%d)",
                 path,
                 p_remote_tp_rank,
                 rp_rank,
+                rp_rank + 1,
+                actual_remote_rp_size,
             )
 
             # Send query for (tp_rank, rp_rank)
-            with zmq_ctx(zmq.REQ, path) as sock:
-                msg = msgspec.msgpack.encode((GET_META_MSG, p_remote_tp_rank, rp_rank))
-                # Set receive timeout to 5 seconds to avoid hanging on dead server
-                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
-                sock.send(msg)
-                metadata_bytes = sock.recv()
-                decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-                metadata = decoder.decode(metadata_bytes)
-                got_metadata_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake (TP=%s, RP=%s): get metadata took: %s",
-                    p_remote_tp_rank,
-                    rp_rank,
-                    got_metadata_time - start_time,
-                )
+            try:
+                with zmq_ctx(zmq.REQ, path) as sock:
+                    msg = msgspec.msgpack.encode((GET_META_MSG, p_remote_tp_rank, rp_rank))
+                    # Set receive timeout to 5 seconds to avoid hanging on dead server
+                    sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                    sock.setsockopt(zmq.SNDTIMEO, 5000)  # Add send timeout too
 
-                # Ensure engine id matches
-                if metadata.engine_id != expected_engine_id:
-                    raise RuntimeError(
-                        f"Remote NIXL agent engine ID mismatch. "
-                        f"Expected {expected_engine_id}, received {metadata.engine_id}."
-                    )
+                    logger.info("[HANDSHAKE] Sending query message for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+                    sock.send(msg)
 
-                # Validate RP metadata
-                # Legacy mode: prefill has rp_size=1 or all metadata at rp_rank=0
-                # In this case, all RP rank requests get same metadata (rp_rank=0)
-                is_legacy_mode = metadata.rp_size <= 1 or (
-                    rp_rank > 0 and metadata.rp_rank == 0
-                )
+                    logger.info("[HANDSHAKE] Waiting for response for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+                    metadata_bytes = sock.recv()
+                    logger.info("[HANDSHAKE] Received response (%d bytes) for TP=%s, RP=%s",
+                               len(metadata_bytes) if metadata_bytes else 0, p_remote_tp_rank, rp_rank)
 
-                if not is_legacy_mode:
-                    # Multi-RP mode: strict validation
-                    assert metadata.rp_size == remote_rp_size, (
-                        f"RP size mismatch: expected {remote_rp_size}, "
-                        f"got {metadata.rp_size}"
-                    )
-                    assert metadata.rp_rank == rp_rank, (
-                        f"RP rank mismatch: expected {rp_rank}, got {metadata.rp_rank}"
-                    )
-                else:
-                    # Legacy mode: accept rp_rank=0 for all requests
-                    if rp_rank > 0:
-                        logger.debug(
-                            "Legacy mode: Using rp_rank=0 metadata for rp_rank=%d request",
-                            rp_rank,
+                    # Check for empty response (metadata not available)
+                    if not metadata_bytes:
+                        raise RuntimeError(
+                            f"Empty metadata response for TP rank {p_remote_tp_rank}, "
+                            f"RP rank {rp_rank}. Prefill may not have metadata for this rank."
                         )
-
-                # Register Remote agent
-                assert metadata.block_size <= self.block_size, "nP > nD is not supported yet."
-
-                remote_agent_name = self.add_remote_agent(
-                    metadata, p_remote_tp_rank, rp_rank, remote_tp_size, remote_rp_size
-                )
-
-                agents[p_remote_tp_rank][rp_rank] = remote_agent_name
-
-                setup_agent_time = time.perf_counter()
-                logger.debug(
-                    "NIXL handshake (TP=%s, RP=%s): add agent took: %s",
+            except zmq.error.Again as e:
+                logger.error(
+                    "[HANDSHAKE] Timeout waiting for metadata response (TP=%s, RP=%s): %s",
                     p_remote_tp_rank,
                     rp_rank,
-                    setup_agent_time - got_metadata_time,
+                    e,
+                )
+                raise RuntimeError(
+                    f"Timeout during handshake for TP rank {p_remote_tp_rank}, RP rank {rp_rank}. "
+                    f"Prefill may not be responding."
+                ) from e
+            except Exception as e:
+                logger.error(
+                    "[HANDSHAKE] Error during ZMQ communication (TP=%s, RP=%s): %s",
+                    p_remote_tp_rank,
+                    rp_rank,
+                    e,
+                )
+                raise
+
+            # Decode metadata (outside try-except block)
+            logger.info("[HANDSHAKE] Decoding metadata for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+            decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+            metadata = decoder.decode(metadata_bytes)
+            got_metadata_time = time.perf_counter()
+            logger.info(
+                "[HANDSHAKE] Decoded metadata for TP=%s, RP=%s (took %.3fs)",
+                p_remote_tp_rank,
+                rp_rank,
+                got_metadata_time - start_time,
+            )
+
+            # Ensure engine id matches
+            if metadata.engine_id != expected_engine_id:
+                raise RuntimeError(
+                    f"Remote NIXL agent engine ID mismatch. "
+                    f"Expected {expected_engine_id}, received {metadata.engine_id}."
                 )
 
-                # Legacy mode optimization: If first handshake shows rp_size=1,
-                # all RP ranks will return same metadata. Fill and early exit.
-                if rp_rank == 0 and metadata.rp_size <= 1:
-                    logger.debug(
-                        "Legacy mode detected (rp_size=%d). "
-                        "Reusing rp_rank=0 agent for all RP ranks.",
-                        metadata.rp_size,
+            # Validate RP metadata
+            # Legacy mode: prefill has rp_size=1 or all metadata at rp_rank=0
+            # In this case, all RP rank requests get same metadata (rp_rank=0)
+            is_legacy_mode = metadata.rp_size <= 1 or (
+                rp_rank > 0 and metadata.rp_rank == 0
+            )
+
+            if not is_legacy_mode:
+                # Multi-RP mode: strict validation
+                assert metadata.rp_size == remote_rp_size, (
+                    f"RP size mismatch: expected {remote_rp_size}, "
+                    f"got {metadata.rp_size}"
+                )
+                assert metadata.rp_rank == rp_rank, (
+                    f"RP rank mismatch: expected {rp_rank}, got {metadata.rp_rank}"
+                )
+            else:
+                # Legacy mode: accept rp_rank=0 for all requests
+                if rp_rank > 0:
+                    logger.info(
+                        "[HANDSHAKE] Legacy mode: Using rp_rank=0 metadata for rp_rank=%d request",
+                        rp_rank,
                     )
-                    # Fill all remaining RP ranks with same agent
+
+            # Register Remote agent
+            logger.info("[HANDSHAKE] Registering remote agent for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+            assert metadata.block_size <= self.block_size, "nP > nD is not supported yet."
+
+            remote_agent_name = self.add_remote_agent(
+                metadata, p_remote_tp_rank, rp_rank, remote_tp_size, remote_rp_size
+            )
+
+            agents[p_remote_tp_rank][rp_rank] = remote_agent_name
+
+            setup_agent_time = time.perf_counter()
+            logger.info(
+                "[HANDSHAKE] Registered agent for TP=%s, RP=%s (took %.3fs)",
+                p_remote_tp_rank,
+                rp_rank,
+                setup_agent_time - got_metadata_time,
+            )
+
+            # First handshake: adjust loop size based on actual prefill rp_size
+            if rp_rank == 0:
+                actual_remote_rp_size = metadata.rp_size
+                if actual_remote_rp_size != remote_rp_size:
+                    logger.info(
+                        "[HANDSHAKE] Adjusting RP size: requested %d, actual %d",
+                        remote_rp_size,
+                        actual_remote_rp_size,
+                    )
+
+                # Legacy mode (rp_size=1): Fill all requested ranks with same agent
+                if actual_remote_rp_size <= 1:
+                    logger.info(
+                        "[HANDSHAKE] Legacy mode detected (rp_size=%d). "
+                        "Reusing rp_rank=0 agent for all requested RP ranks.",
+                        actual_remote_rp_size,
+                    )
+                    # Fill all requested RP ranks with same agent
                     for remaining_rp_rank in range(1, remote_rp_size):
                         agents[p_remote_tp_rank][remaining_rp_rank] = remote_agent_name
                     break  # Early exit, no need to handshake remaining ranks
