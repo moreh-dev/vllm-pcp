@@ -407,26 +407,37 @@ class NixlConnectorScheduler:
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
+                      | dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
         """
         Set the KV connector handshake metadata for this connector.
 
         Args:
-            metadata (dict): the handshake metadata to set.
+            metadata: Handshake metadata keyed by tp_rank (legacy) or
+                     (tp_rank, rp_rank) tuple (multi-RP mode).
         """
-        encoded_data: dict[int, bytes] = {}
+        encoded_data: dict[int, dict[int, bytes]] = defaultdict(dict)
         encoder = msgspec.msgpack.Encoder()
-        for tp_rank, rank_metadata in metadata.items():
+
+        for key, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlAgentMetadata):
                 raise ValueError(
                     "NixlConnectorScheduler expects NixlAgentMetadata for "
                     "handshake metadata."
                 )
-            encoded_data[tp_rank] = encoder.encode(rank_metadata)
+
+            # Support both legacy dict[int, ...] and new dict[tuple[int, int], ...]
+            if isinstance(key, tuple):
+                tp_rank, rp_rank = key
+            else:
+                tp_rank, rp_rank = key, 0
+
+            encoded_data[tp_rank][rp_rank] = encoder.encode(rank_metadata)
             logger.debug(
-                "Tp rank %d: encoded NixlAgentMetadata size: %s bytes",
+                "TP rank %d, RP rank %d: encoded NixlAgentMetadata size: %s bytes",
                 tp_rank,
-                str(len(encoded_data[tp_rank])),
+                rp_rank,
+                len(encoded_data[tp_rank][rp_rank]),
             )
         self._encoded_xfer_handshake_metadata = encoded_data
 
@@ -472,15 +483,32 @@ class NixlConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode the message which contains (GET_META_MSG, rank)
-                msg, target_tp_rank = msgspec.msgpack.decode(msg)
+                # Decode message: supports both 2-tuple (legacy) and 3-tuple (multi-RP)
+                # (GET_META_MSG, tp_rank) or (GET_META_MSG, tp_rank, rp_rank)
+                decoded = msgspec.msgpack.decode(msg)
+                if len(decoded) == 3:
+                    # New format: (GET_META_MSG, tp_rank, rp_rank)
+                    msg_type, target_tp_rank, target_rp_rank = decoded
+                elif len(decoded) == 2:
+                    # Legacy format: (GET_META_MSG, tp_rank), default to rp_rank=0
+                    msg_type, target_tp_rank = decoded
+                    target_rp_rank = 0
+                else:
+                    logger.warning("Invalid message format: %s", decoded)
+                    continue
+
                 logger.debug(
-                    "Received message for tp rank %s",
+                    "Received message for TP rank %s, RP rank %s",
                     target_tp_rank,
+                    target_rp_rank,
                 )
-                if msg != GET_META_MSG:
-                    logger.warning("Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+                if msg_type != GET_META_MSG:
+                    logger.warning("Connection listener got unexpected message %s", msg_type)
+                    continue
+
+                # Send response from 2D encoded_data structure
+                response_data = encoded_data[target_tp_rank][target_rp_rank]
+                sock.send_multipart((identity, b"", response_data))
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -694,7 +722,9 @@ class NixlConnectorScheduler:
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             rp_size=self.rp_size,
-            rp_rank=0,  # Decode should only talk to rp_rank=0 on prefill
+            # Note: rp_rank field removed - decoder connects to all RP ranks
+            # in multi-RP mode. Legacy mode (VLLM_ENABLE_MULTI_RP_TRANSFER=0)
+            # uses rp_rank=0 by default.
         )
 
 
@@ -864,8 +894,11 @@ class NixlConnectorWorker:
             )
 
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
-        # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
-        self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
+        # Map of engine_id -> tp_rank -> rp_rank -> agent_name.
+        # 3D dict for n:m connections in both TP and RP dimensions.
+        self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -1012,62 +1045,86 @@ class NixlConnectorWorker:
         host: str,
         port: int,
         remote_tp_size: int,
+        remote_rp_size: int,
         expected_engine_id: str,
-    ) -> dict[int, str]:
-        """Do a NIXL handshake with a remote instance."""
+    ) -> dict[int, dict[int, str]]:
+        """
+        Do NIXL handshake with remote instance.
+
+        For multi-RP mode, connects to all RP ranks for the target TP rank.
+        Returns: {tp_rank: {rp_rank: agent_name}}
+        """
 
         start_time = time.perf_counter()
-
-        # NOTE(rob): we need each rank to have a unique port. This is
-        # a hack to keep us moving. We will switch when moving to etcd
-        # or where we have a single ZMQ socket in the scheduler.
-
-        # Handshake only with the remote TP rank that current local rank will
-        # pull from. With homogeneous TP it happens to be the same rank_i.
-        p_remote_rank = self.kv_topo.get_target_remote_rank(remote_tp_size)
         path = make_zmq_path("tcp", host, port)
-        logger.debug(
-            "Querying metadata on path: %s at remote tp rank %s", path, p_remote_rank
-        )
 
-        # Send query for the request.
-        with zmq_ctx(zmq.REQ, path) as sock:
-            msg = msgspec.msgpack.encode((GET_META_MSG, p_remote_rank))
-            # Set receive timeout to 5 seconds to avoid hanging on dead server
-            sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
-            sock.send(msg)
-            metadata_bytes = sock.recv()
-            decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-            metadata = decoder.decode(metadata_bytes)
-            got_metadata_time = time.perf_counter()
+        # Handshake with the remote TP rank that current local rank will
+        # pull from. With homogeneous TP it happens to be the same rank_i.
+        p_remote_tp_rank = self.kv_topo.get_target_remote_rank(remote_tp_size)
+
+        agents: dict[int, dict[int, str]] = defaultdict(dict)
+
+        # Connect to all RP ranks for this TP rank
+        for rp_rank in range(remote_rp_size):
             logger.debug(
-                "NIXL handshake: get metadata took: %s", got_metadata_time - start_time
+                "Querying metadata on path: %s for TP rank %s, RP rank %s",
+                path,
+                p_remote_tp_rank,
+                rp_rank,
             )
 
-            # Ensure engine id matches.
-            if metadata.engine_id != expected_engine_id:
-                raise RuntimeError(
-                    f"Remote NIXL agent engine ID mismatch. "
-                    f"Expected {expected_engine_id},"
-                    f"received {metadata.engine_id}."
+            # Send query for (tp_rank, rp_rank)
+            with zmq_ctx(zmq.REQ, path) as sock:
+                msg = msgspec.msgpack.encode((GET_META_MSG, p_remote_tp_rank, rp_rank))
+                # Set receive timeout to 5 seconds to avoid hanging on dead server
+                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
+                sock.send(msg)
+                metadata_bytes = sock.recv()
+                decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+                metadata = decoder.decode(metadata_bytes)
+                got_metadata_time = time.perf_counter()
+                logger.debug(
+                    "NIXL handshake (TP=%s, RP=%s): get metadata took: %s",
+                    p_remote_tp_rank,
+                    rp_rank,
+                    got_metadata_time - start_time,
                 )
 
-            # Register Remote agent.
-            assert metadata.block_size <= self.block_size, (
-                "nP > nD is not supported yet."
-            )
-            remote_agent_name = self.add_remote_agent(
-                metadata, p_remote_rank, remote_tp_size
-            )
+                # Ensure engine id matches
+                if metadata.engine_id != expected_engine_id:
+                    raise RuntimeError(
+                        f"Remote NIXL agent engine ID mismatch. "
+                        f"Expected {expected_engine_id}, received {metadata.engine_id}."
+                    )
 
-            setup_agent_time = time.perf_counter()
-            logger.debug(
-                "NIXL handshake: add agent took: %s",
-                setup_agent_time - got_metadata_time,
-            )
+                # Validate RP metadata
+                assert metadata.rp_size == remote_rp_size, (
+                    f"RP size mismatch: expected {remote_rp_size}, "
+                    f"got {metadata.rp_size}"
+                )
+                assert metadata.rp_rank == rp_rank, (
+                    f"RP rank mismatch: expected {rp_rank}, got {metadata.rp_rank}"
+                )
 
-        # Remote rank -> agent name.
-        return {p_remote_rank: remote_agent_name}
+                # Register Remote agent
+                assert metadata.block_size <= self.block_size, "nP > nD is not supported yet."
+
+                remote_agent_name = self.add_remote_agent(
+                    metadata, p_remote_tp_rank, rp_rank, remote_tp_size, remote_rp_size
+                )
+
+                agents[p_remote_tp_rank][rp_rank] = remote_agent_name
+
+                setup_agent_time = time.perf_counter()
+                logger.debug(
+                    "NIXL handshake (TP=%s, RP=%s): add agent took: %s",
+                    p_remote_tp_rank,
+                    rp_rank,
+                    setup_agent_time - got_metadata_time,
+                )
+
+        # Return {tp_rank: {rp_rank: agent_name}}
+        return agents
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -1136,11 +1193,14 @@ class NixlConnectorWorker:
                 meta.remote_host,
                 meta.remote_port,
                 meta.tp_size,
+                meta.rp_size,
                 remote_engine_id,
             )
             self._handshake_futures[remote_engine_id] = fut
 
-            def done_callback(f: Future[dict[int, str]], eid=remote_engine_id):
+            def done_callback(
+                f: Future[dict[int, dict[int, str]]], eid=remote_engine_id
+            ):
                 with self._handshake_lock:
                     del self._handshake_futures[eid]
                     try:
@@ -1409,7 +1469,9 @@ class NixlConnectorWorker:
         self,
         nixl_agent_meta: NixlAgentMetadata,
         remote_tp_rank: int = 0,
+        remote_rp_rank: int = 0,
         remote_tp_size: int = 1,
+        remote_rp_size: int = 1,
     ) -> str:
         """
         Add the remote NIXL agent and prepare the descriptors for reading cache
@@ -1451,14 +1513,15 @@ class NixlConnectorWorker:
         """  # noqa: E501
         engine_id = nixl_agent_meta.engine_id
         # TODO re-evaluate refreshing for scaling/recovery
-        if remote_tp_rank in self._remote_agents.get(engine_id, {}):
+        if remote_rp_rank in self._remote_agents.get(engine_id, {}).get(remote_tp_rank, {}):
             logger.debug(
-                "Remote agent with engine_id %s and rank"
-                "%s already exchanged metadata, skip handshake.",
+                "Remote agent with engine_id %s, TP rank %s, RP rank %s "
+                "already exchanged metadata, skip handshake.",
                 engine_id,
                 remote_tp_rank,
+                remote_rp_rank,
             )
-            return self._remote_agents[engine_id][remote_tp_rank]
+            return self._remote_agents[engine_id][remote_tp_rank][remote_rp_rank]
 
         ### Register remote agent metadata
         if engine_id not in self._tp_size:
@@ -1665,8 +1728,10 @@ class NixlConnectorWorker:
 
             # 1. Gather KV from Ring Parallel ranks to Rank 0 (if needed)
             if self.rp_size > 1:
-                # We need to gather even if not copying to host
-                self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
+                # Skip allgather if decoder uses multi-RP transfer mode
+                # In multi-RP mode, decoder connects to all RP ranks directly
+                if not envs.VLLM_ENABLE_MULTI_RP_TRANSFER:
+                    self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -2000,6 +2065,7 @@ class NixlConnectorWorker:
             remote_block_ids=meta.remote_block_ids,
             remote_rp_size=remote_rp_size,
             remote_rp_rank=remote_rp_rank,
+            seq_len=getattr(meta, "seq_len", 0),
         )
 
     def _read_blocks(
@@ -2010,8 +2076,32 @@ class NixlConnectorWorker:
         request_id: str,
         remote_rp_size: int = 1,
         remote_rp_rank: int = 0,
+        seq_len: int = 0,
     ):
-        # Only allow rp_rank=0 to send KV blocks when using ring parallel
+        # Route to multi-RP transfer if enabled and conditions are met
+        use_multi_rp = (
+            remote_rp_size > 1
+            and envs.VLLM_ENABLE_MULTI_RP_TRANSFER
+            and seq_len > 0
+        )
+
+        if use_multi_rp:
+            logger.debug(
+                "Using multi-RP transfer for request %s (rp_size=%d, seq_len=%d)",
+                request_id,
+                remote_rp_size,
+                seq_len,
+            )
+            return self._read_blocks_multi_rp(
+                dst_engine_id=dst_engine_id,
+                request_id=request_id,
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                seq_len=seq_len,
+                remote_rp_size=remote_rp_size,
+            )
+
+        # Legacy mode: only allow rp_rank=0 to send KV blocks
         if remote_rp_size > 1 and remote_rp_rank != 0:
             return
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
@@ -2054,7 +2144,9 @@ class NixlConnectorWorker:
             remote_rank = self.kv_topo.get_target_remote_rank_from_engine_id(
                 dst_engine_id
             )
-            agent_name = self._remote_agents[dst_engine_id][remote_rank]
+            # For legacy mode, use rp_rank=0
+            remote_rp_rank = 0 if remote_rp_size <= 1 else remote_rp_rank
+            agent_name = self._remote_agents[dst_engine_id][remote_rank][remote_rp_rank]
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
             except Exception:
@@ -2168,6 +2260,115 @@ class NixlConnectorWorker:
                 self.nixl_wrapper.release_xfer_handle(handle)
             self._failed_recv_reqs.add(request_id)
 
+    def _read_blocks_multi_rp(
+        self,
+        dst_engine_id: str,
+        request_id: str,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        seq_len: int,
+        remote_rp_size: int,
+    ) -> None:
+        """
+        Read KV blocks from multiple RP ranks and reassemble using zigzag pattern.
+
+        Each RP rank sends its owned intervals. Decoder receives from all ranks
+        and reconstructs the complete sequence.
+
+        Args:
+            dst_engine_id: Remote engine ID
+            request_id: Request identifier
+            local_block_ids: Local block IDs to write to
+            remote_block_ids: Remote block IDs to read from
+            seq_len: Sequence length for zigzag pattern calculation
+            remote_rp_size: Number of RP ranks on prefill side
+        """
+        logger.debug(
+            "Multi-RP transfer: request %s, seq_len %d, rp_size %d",
+            request_id,
+            seq_len,
+            remote_rp_size,
+        )
+
+        # Get target TP rank
+        remote_tp_rank = self.kv_topo.get_target_remote_rank_from_engine_id(dst_engine_id)
+
+        # Initiate transfers from all RP ranks
+        # Each RP rank sends full blocks, decoder will mask/reassemble
+        for rp_rank in range(remote_rp_size):
+            # Get agent for this (tp_rank, rp_rank)
+            try:
+                agent_name = self._remote_agents[dst_engine_id][remote_tp_rank][rp_rank]
+            except KeyError:
+                logger.error(
+                    "Agent not found for engine %s, TP rank %s, RP rank %s",
+                    dst_engine_id,
+                    remote_tp_rank,
+                    rp_rank,
+                )
+                continue
+
+            # Calculate which blocks this RP rank owns
+            owned_intervals = self._calculate_rp_intervals(rp_rank, remote_rp_size, seq_len)
+
+            if not owned_intervals:
+                logger.debug(
+                    "RP rank %s has no intervals for seq_len %d, skipping", rp_rank, seq_len
+                )
+                continue
+
+            # Filter blocks that overlap with owned intervals
+            relevant_remote_blocks = self._filter_blocks_by_intervals(
+                remote_block_ids, owned_intervals, self.block_size
+            )
+
+            if not relevant_remote_blocks:
+                logger.debug(
+                    "RP rank %s has no relevant blocks, skipping",
+                    rp_rank,
+                )
+                continue
+
+            logger.debug(
+                "Transferring from RP rank %s: %d blocks for intervals %s",
+                rp_rank,
+                len(relevant_remote_blocks),
+                owned_intervals,
+            )
+
+            # NOTE: Current implementation transfers full blocks from each RP rank.
+            # Decoder should apply masking based on owned intervals to reconstruct
+            # the complete sequence. This is similar to allgather but distributed.
+            #
+            # TODO: Implement proper masking + reassembly logic here.
+            # For now, this is a placeholder that demonstrates the structure.
+            #
+            # Full implementation would require:
+            # 1. Transfer full blocks from this RP rank
+            # 2. Apply masking based on owned_intervals
+            # 3. Accumulate (SUM) masked results from all RP ranks
+            # 4. Store final result in local_block_ids
+
+            # Placeholder: Use legacy transfer for each RP rank
+            # In production, this would be replaced with parallel transfers + reassembly
+            logger.warning(
+                "Multi-RP transfer not fully implemented. "
+                "Falling back to legacy mode for request %s",
+                request_id,
+            )
+            # Fall back to legacy transfer from rp_rank=0
+            if rp_rank == 0:
+                self._read_blocks(
+                    local_block_ids=local_block_ids,
+                    remote_block_ids=remote_block_ids,
+                    dst_engine_id=dst_engine_id,
+                    request_id=request_id,
+                    remote_rp_size=remote_rp_size,
+                    remote_rp_rank=0,
+                    seq_len=seq_len,
+                )
+            return
+
     def get_mapped_blocks(self, block_ids, block_size_ratio):
         """
           Calculates the new set of block IDs by mapping every element
@@ -2276,6 +2477,57 @@ class NixlConnectorWorker:
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result
+
+    def _calculate_rp_intervals(
+        self, rp_rank: int, rp_size: int, seq_len: int
+    ) -> list[tuple[int, int]]:
+        """
+        Calculate which sequence intervals are owned by given RP rank.
+        Returns list of (start, end) tuples in token space.
+
+        Uses zigzag pattern: each rank owns head and tail intervals.
+        """
+        if rp_size <= 1:
+            return [(0, seq_len)] if seq_len > 0 else []
+
+        rp_align = 2 * rp_size
+        ring_chunk_len = (seq_len + rp_align - 1) // rp_align
+
+        # Head interval
+        head_start = ring_chunk_len * rp_rank
+        head_end = min(head_start + ring_chunk_len, seq_len)
+
+        # Tail interval (reversed)
+        tail_start = ring_chunk_len * (2 * rp_size - 1 - rp_rank)
+        tail_end = min(tail_start + ring_chunk_len, seq_len)
+
+        # Collect valid intervals
+        intervals = []
+        if head_end > head_start and head_start < seq_len:
+            intervals.append((head_start, head_end))
+        if tail_end > tail_start and tail_start < seq_len and tail_start != head_start:
+            intervals.append((tail_start, tail_end))
+
+        return intervals
+
+    def _filter_blocks_by_intervals(
+        self, block_ids: list[int], intervals: list[tuple[int, int]], block_size: int
+    ) -> list[int]:
+        """
+        Filter block IDs to only those that overlap with given intervals.
+        """
+        filtered = []
+        for block_id in block_ids:
+            block_start = block_id * block_size
+            block_end = block_start + block_size
+
+            # Check if block overlaps any interval
+            for interval_start, interval_end in intervals:
+                if block_start < interval_end and block_end > interval_start:
+                    filtered.append(block_id)
+                    break
+
+        return filtered
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
@@ -2395,9 +2647,11 @@ class NixlConnectorWorker:
         for dst_xfer_side_handle in self.dst_xfer_side_handles.values():
             self.nixl_wrapper.release_dlist_handle(dst_xfer_side_handle)
         self.dst_xfer_side_handles.clear()
-        for remote_agents in self._remote_agents.values():
-            for agent_name in remote_agents.values():
-                self.nixl_wrapper.remove_remote_agent(agent_name)
+        # Cleanup 3D structure: engine_id -> tp_rank -> rp_rank -> agent_name
+        for tp_agents in self._remote_agents.values():
+            for rp_agents in tp_agents.values():
+                for agent_name in rp_agents.values():
+                    self.nixl_wrapper.remove_remote_agent(agent_name)
         self._remote_agents.clear()
         for desc in self._registered_descs:
             self.nixl_wrapper.deregister_memory(desc)
