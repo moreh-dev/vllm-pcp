@@ -585,9 +585,10 @@ class NixlConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "NIXLConnector get_num_new_matched_tokens: "
+        logger.info(
+            "[GET_TOKENS] get_num_new_matched_tokens: request_id=%s, "
             "num_computed_tokens=%s, kv_transfer_params=%s",
+            request.request_id,
             num_computed_tokens,
             params,
         )
@@ -596,32 +597,44 @@ class NixlConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
+            logger.info(
+                "[GET_TOKENS] Remote prefill detected for request %s: will pull %d tokens",
+                request.request_id,
+                count,
+            )
             if count > 0:
                 return count, True
 
         # No remote prefill for this request.
+        logger.info("[GET_TOKENS] No remote prefill for request %s", request.request_id)
         return 0, False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         params = request.kv_transfer_params
-        logger.debug(
-            "NIXLConnector update_state_after_alloc: "
+        logger.info(
+            "[UPDATE_STATE] update_state_after_alloc: request_id=%s, "
             "num_external_tokens=%s, kv_transfer_params=%s",
+            request.request_id,
             num_external_tokens,
             params,
         )
 
         if not params:
+            logger.info("[UPDATE_STATE] No kv_transfer_params for request %s", request.request_id)
             return
 
-        # For prefill (which is what we care about here for RP gather), 
+        # For prefill (which is what we care about here for RP gather),
         # the sequence length is the number of prompt tokens.
         # num_external_tokens is 0 for local prefill.
         seq_len = len(request.prompt_token_ids) if request.prompt_token_ids else 0
 
         if params.get("do_remote_decode"):
+            logger.info(
+                "[UPDATE_STATE] Remote decode detected for request %s, adding to batch",
+                request.request_id,
+            )
             self._reqs_in_batch.add(request.request_id)
         
         # NOTE: when accelerator is not directly supported by Nixl,
@@ -1853,21 +1866,34 @@ class NixlConnectorWorker:
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
         """copy kv from device to host buffer or gather kv from remote ranks."""
-        
+
+        logger.info("[SAVE_KV] save_kv_to_host called with %d requests", len(metadata.reqs_to_save))
+
         # Determine if we need to copy to host
         do_host_copy = self.use_host_buffer and self.copy_blocks is not None
-        
+        logger.info("[SAVE_KV] do_host_copy=%s, rp_size=%d, rp_rank=%d",
+                   do_host_copy, self.rp_size, self.rp_rank)
+
         for req_id, meta in metadata.reqs_to_save.items():
+            logger.info("[SAVE_KV] Processing request %s with %d blocks",
+                       req_id, len(meta.local_block_ids))
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
             )
 
             # 1. Gather KV from Ring Parallel ranks to Rank 0 (if needed)
             if self.rp_size > 1:
+                logger.info(
+                    "[SAVE_KV] RP size > 1 detected. multi_rp_enabled=%s",
+                    envs.VLLM_ENABLE_MULTI_RP_TRANSFER
+                )
                 # Skip allgather if decoder uses multi-RP transfer mode
                 # In multi-RP mode, decoder connects to all RP ranks directly
                 if not envs.VLLM_ENABLE_MULTI_RP_TRANSFER:
+                    logger.info("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
                     self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
+                else:
+                    logger.info("[SAVE_KV] Skipping allgather (multi-RP mode enabled) for request %s", req_id)
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -2133,6 +2159,8 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        logger.info("[START_LOAD] start_load_kv called with %d requests to receive", len(metadata.reqs_to_recv))
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -2141,9 +2169,9 @@ class NixlConnectorWorker:
                 meta.remote_block_ids
             )
             remote_engine_id = meta.remote_engine_id
-            logger.debug(
-                "start_load_kv for request %s from remote engine %s. "
-                "Num local_block_ids: %s. Num remote_block_ids: %s. ",
+            logger.info(
+                "[START_LOAD] Processing request %s from remote engine %s: "
+                "%d local blocks, %d remote blocks",
                 req_id,
                 remote_engine_id,
                 len(meta.local_physical_block_ids),
@@ -2186,14 +2214,21 @@ class NixlConnectorWorker:
                 self._reqs_to_send[req_id] = expiration_time
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
-        logger.debug(
-            "Remote agent %s available, calling _read_blocks for req %s",
+        logger.info(
+            "[READ_BLOCKS] Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id,
             req_id,
         )
         # Use rp_size and rp_rank from handshake metadata, falling back to meta if not available
         remote_rp_size = self._rp_size.get(meta.remote_engine_id, meta.rp_size)
         remote_rp_rank = self._rp_rank.get(meta.remote_engine_id, meta.rp_rank)
+        logger.info(
+            "[READ_BLOCKS] Request %s: remote_rp_size=%d, remote_rp_rank=%d, seq_len=%d",
+            req_id,
+            remote_rp_size,
+            remote_rp_rank,
+            getattr(meta, "seq_len", 0),
+        )
         self._read_blocks(
             request_id=req_id,
             dst_engine_id=meta.remote_engine_id,
@@ -2214,6 +2249,16 @@ class NixlConnectorWorker:
         remote_rp_rank: int = 0,
         seq_len: int = 0,
     ):
+        logger.info(
+            "[READ_BLOCKS] _read_blocks called for request %s: "
+            "remote_rp_size=%d, remote_rp_rank=%d, seq_len=%d, multi_rp_enabled=%s",
+            request_id,
+            remote_rp_size,
+            remote_rp_rank,
+            seq_len,
+            envs.VLLM_ENABLE_MULTI_RP_TRANSFER,
+        )
+
         # Route to multi-RP transfer if enabled and conditions are met
         use_multi_rp = (
             remote_rp_size > 1
@@ -2222,8 +2267,8 @@ class NixlConnectorWorker:
         )
 
         if use_multi_rp:
-            logger.debug(
-                "Using multi-RP transfer for request %s (rp_size=%d, seq_len=%d)",
+            logger.info(
+                "[READ_BLOCKS] Using multi-RP transfer for request %s (rp_size=%d, seq_len=%d)",
                 request_id,
                 remote_rp_size,
                 seq_len,
@@ -2238,7 +2283,17 @@ class NixlConnectorWorker:
             )
 
         # Legacy mode: only allow rp_rank=0 to send KV blocks
+        logger.info(
+            "[READ_BLOCKS] Using legacy mode for request %s (rp_size=%d, rp_rank=%d)",
+            request_id,
+            remote_rp_size,
+            remote_rp_rank,
+        )
         if remote_rp_size > 1 and remote_rp_rank != 0:
+            logger.info(
+                "[READ_BLOCKS] Skipping transfer: non-zero RP rank (%d) in legacy mode",
+                remote_rp_rank,
+            )
             return
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
         if block_size_ratio > 1:
