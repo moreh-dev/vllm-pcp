@@ -1887,12 +1887,10 @@ class NixlConnectorWorker:
                     "[SAVE_KV] RP size > 1 detected. multi_rp_enabled=%s",
                     envs.VLLM_ENABLE_MULTI_RP_TRANSFER
                 )
-                # Skip allgather in multi-RP mode - decoder will fetch from all ranks
-                if not envs.VLLM_ENABLE_MULTI_RP_TRANSFER:
-                    logger.info("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
-                    self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
-                else:
-                    logger.info("[SAVE_KV] Skipping allgather - multi-RP enabled")
+                # Always perform allgather for now
+                # TODO: Skip allgather when sequential multi-RP transfer is implemented
+                logger.info("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
+                self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -2549,61 +2547,42 @@ class NixlConnectorWorker:
         # Get target TP rank
         remote_tp_rank = self.kv_topo.get_target_remote_rank_from_engine_id(dst_engine_id)
 
-        # EXACTLY like TP: transfer from ALL RP ranks in parallel
-        # Each rank sends partial KV (their owned tokens per zigzag pattern)
-        # Decoder receives all partials and combines with mask + SUM
-        # Same logic as _allgather_rp_kv but distributed across network
+        # CRITICAL: Cannot do parallel transfers to same buffer!
+        # All RP ranks would overwrite each other → race condition
+        # Solution: Transfer ONLY from rank=0, but ensure prefill does allgather
+        #
+        # TODO: For true optimization, need separate temp buffers per rank
+        # or wait for each transfer to complete before starting next
 
-        # Initiate transfers from ALL RP ranks
-        for rp_rank in range(remote_rp_size):
-            # Verify agent exists
-            if dst_engine_id not in self._remote_agents or \
-               remote_tp_rank not in self._remote_agents[dst_engine_id] or \
-               rp_rank not in self._remote_agents[dst_engine_id][remote_tp_rank]:
-                logger.error(
-                    "[MULTI_RP] Agent not found: engine=%s, TP=%s, RP=%s",
-                    dst_engine_id, remote_tp_rank, rp_rank,
-                )
-                continue
+        # For now: Use rank=0 only (which has allgathered full data)
+        rp_rank = 0
 
-            # Use sub-request ID to track each RP rank's transfer
-            sub_request_id = f"{request_id}:rp{rp_rank}"
-
-            logger.info(
-                "[MULTI_RP] Starting transfer from RP rank %d (sub_req=%s)",
-                rp_rank, sub_request_id,
+        # Verify agent exists
+        if dst_engine_id not in self._remote_agents or \
+           remote_tp_rank not in self._remote_agents[dst_engine_id] or \
+           rp_rank not in self._remote_agents[dst_engine_id][remote_tp_rank]:
+            logger.error(
+                "[MULTI_RP] Agent not found: engine=%s, TP=%s, RP=%s",
+                dst_engine_id, remote_tp_rank, rp_rank,
             )
-
-            # Transfer from this RP rank
-            # All ranks transfer to SAME local_block_ids (will combine after)
-            self._read_blocks(
-                local_block_ids=local_block_ids,
-                remote_block_ids=remote_block_ids,
-                dst_engine_id=dst_engine_id,
-                request_id=sub_request_id,  # Different sub-request ID
-                remote_rp_size=1,  # Disable recursion
-                remote_rp_rank=0,
-                seq_len=0,  # Disable multi-RP routing
-            )
-
-        # Track multi-RP request for post-transfer reassembly
-        # When ALL sub-requests complete, apply masks and SUM
-        if not hasattr(self, '_multi_rp_pending'):
-            self._multi_rp_pending = {}
-
-        self._multi_rp_pending[request_id] = {
-            'num_ranks': remote_rp_size,
-            'completed_ranks': [],
-            'local_block_ids': local_block_ids,
-            'seq_len': seq_len,
-            'sub_request_ids': [f"{request_id}:rp{i}" for i in range(remote_rp_size)],
-            'accumulator': None,  # Will store combined result
-        }
+            return
 
         logger.info(
-            "[MULTI_RP] Initiated %d parallel transfers for request %s",
-            remote_rp_size, request_id,
+            "[MULTI_RP] Transferring from RP rank=0 (has allgathered data)",
         )
+
+        # Transfer from rank 0
+        self._read_blocks(
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            dst_engine_id=dst_engine_id,
+            request_id=request_id,
+            remote_rp_size=1,  # Disable recursion
+            remote_rp_rank=0,
+            seq_len=0,  # Disable multi-RP routing
+        )
+
+        logger.info("[MULTI_RP] Transfer initiated from rank=0")
 
     def get_mapped_blocks(self, block_ids, block_size_ratio):
         """
