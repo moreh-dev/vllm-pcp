@@ -1887,13 +1887,12 @@ class NixlConnectorWorker:
                     "[SAVE_KV] RP size > 1 detected. multi_rp_enabled=%s",
                     envs.VLLM_ENABLE_MULTI_RP_TRANSFER
                 )
-                # Skip allgather if decoder uses multi-RP transfer mode
-                # In multi-RP mode, decoder connects to all RP ranks directly
+                # Skip allgather in multi-RP mode - decoder will fetch from all ranks
                 if not envs.VLLM_ENABLE_MULTI_RP_TRANSFER:
                     logger.info("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
                     self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
                 else:
-                    logger.info("[SAVE_KV] Skipping allgather (multi-RP mode enabled) for request %s", req_id)
+                    logger.info("[SAVE_KV] Skipping allgather - multi-RP enabled")
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -2135,9 +2134,74 @@ class NixlConnectorWorker:
                     in_progress = False
 
             if not in_progress:
-                done_req_ids.add(req_id)
+                # Check if this is a multi-RP sub-request (format: "parent:rpN")
+                if ":rp" in req_id:
+                    # This is a multi-RP sub-request - handle reassembly
+                    self._handle_multi_rp_completion(req_id, done_req_ids)
+                else:
+                    # Normal request - mark as done
+                    done_req_ids.add(req_id)
                 del transfers[req_id]
         return done_req_ids
+
+    def _handle_multi_rp_completion(self, sub_request_id: str, done_req_ids: set[str]):
+        """
+        Handle completion of a multi-RP sub-request.
+        Apply masking and accumulate into parent request's result.
+
+        Args:
+            sub_request_id: Sub-request ID (format: "parent_id:rpN")
+            done_req_ids: Set to add parent request ID when all sub-requests complete
+        """
+        # Parse parent request ID and RP rank from sub-request ID
+        parts = sub_request_id.rsplit(":rp", 1)
+        if len(parts) != 2:
+            logger.error("[MULTI_RP] Invalid sub-request ID format: %s", sub_request_id)
+            return
+
+        parent_request_id = parts[0]
+        try:
+            rp_rank = int(parts[1])
+        except ValueError:
+            logger.error("[MULTI_RP] Invalid RP rank in sub-request ID: %s", sub_request_id)
+            return
+
+        # Get parent request metadata
+        if not hasattr(self, '_multi_rp_pending') or parent_request_id not in self._multi_rp_pending:
+            logger.warning("[MULTI_RP] No pending metadata for parent request %s", parent_request_id)
+            return
+
+        parent_meta = self._multi_rp_pending[parent_request_id]
+        local_block_ids = parent_meta['local_block_ids']
+        seq_len = parent_meta['seq_len']
+        num_ranks = parent_meta['num_ranks']
+
+        logger.info(
+            "[MULTI_RP] Sub-request %s completed (parent=%s, rp_rank=%d, %d/%d ranks)",
+            sub_request_id, parent_request_id, rp_rank,
+            len(parent_meta['completed_ranks']) + 1, num_ranks,
+        )
+
+        # Apply masking and accumulation (same logic as _allgather_rp_kv)
+        self._apply_rp_mask_and_accumulate(
+            parent_meta, rp_rank, local_block_ids, seq_len, num_ranks
+        )
+
+        # Mark this rank as completed
+        parent_meta['completed_ranks'].append(rp_rank)
+
+        # Check if all ranks completed
+        if len(parent_meta['completed_ranks']) == num_ranks:
+            logger.info(
+                "[MULTI_RP] All %d ranks completed for parent request %s - reassembly done",
+                num_ranks, parent_request_id,
+            )
+            # Write accumulated result to KV cache
+            self._finalize_multi_rp_accumulation(parent_meta, local_block_ids)
+            # Mark parent request as done
+            done_req_ids.add(parent_request_id)
+            # Cleanup metadata
+            del self._multi_rp_pending[parent_request_id]
 
     def _handle_failed_transfer(self, req_id: str, handle: int):
         """
@@ -2461,104 +2525,85 @@ class NixlConnectorWorker:
         remote_rp_size: int,
     ) -> None:
         """
-        Read KV blocks from multiple RP ranks and reassemble using zigzag pattern.
+        Read KV blocks from ALL RP ranks and reassemble using zigzag pattern.
 
-        Each RP rank sends its owned intervals. Decoder receives from all ranks
-        and reconstructs the complete sequence.
+        Each RP rank has partial KV (their owned tokens only).
+        Decoder receives from ALL ranks sequentially and combines on GPU.
 
-        Args:
-            dst_engine_id: Remote engine ID
-            request_id: Request identifier
-            local_block_ids: Local block IDs to write to
-            remote_block_ids: Remote block IDs to read from
-            seq_len: Sequence length for zigzag pattern calculation
-            remote_rp_size: Number of RP ranks on prefill side
+        Strategy:
+        1. Transfer from rank=0 → stores in local_block_ids (partial data)
+        2. Apply mask to zero out non-owned tokens
+        3. Transfer from rank=1 → stores in same local_block_ids (overwrites!)
+        4. Apply mask + ADD to previous result
+        5. Repeat for all ranks
+        6. Final result = SUM of all masked partials = complete KV
         """
-        logger.debug(
-            "Multi-RP transfer: request %s, seq_len %d, rp_size %d",
+        logger.info(
+            "[MULTI_RP] Multi-RP transfer: request=%s, seq_len=%d, rp_size=%d, blocks=%d",
             request_id,
             seq_len,
             remote_rp_size,
+            len(local_block_ids),
         )
 
         # Get target TP rank
         remote_tp_rank = self.kv_topo.get_target_remote_rank_from_engine_id(dst_engine_id)
 
-        # Initiate transfers from all RP ranks
-        # Each RP rank sends full blocks, decoder will mask/reassemble
+        # EXACTLY like TP: transfer from ALL RP ranks in parallel
+        # Each rank sends partial KV (their owned tokens per zigzag pattern)
+        # Decoder receives all partials and combines with mask + SUM
+        # Same logic as _allgather_rp_kv but distributed across network
+
+        # Initiate transfers from ALL RP ranks
         for rp_rank in range(remote_rp_size):
-            # Get agent for this (tp_rank, rp_rank)
-            try:
-                agent_name = self._remote_agents[dst_engine_id][remote_tp_rank][rp_rank]
-            except KeyError:
+            # Verify agent exists
+            if dst_engine_id not in self._remote_agents or \
+               remote_tp_rank not in self._remote_agents[dst_engine_id] or \
+               rp_rank not in self._remote_agents[dst_engine_id][remote_tp_rank]:
                 logger.error(
-                    "Agent not found for engine %s, TP rank %s, RP rank %s",
-                    dst_engine_id,
-                    remote_tp_rank,
-                    rp_rank,
+                    "[MULTI_RP] Agent not found: engine=%s, TP=%s, RP=%s",
+                    dst_engine_id, remote_tp_rank, rp_rank,
                 )
                 continue
 
-            # Calculate which blocks this RP rank owns
-            owned_intervals = self._calculate_rp_intervals(rp_rank, remote_rp_size, seq_len)
+            # Use sub-request ID to track each RP rank's transfer
+            sub_request_id = f"{request_id}:rp{rp_rank}"
 
-            if not owned_intervals:
-                logger.debug(
-                    "RP rank %s has no intervals for seq_len %d, skipping", rp_rank, seq_len
-                )
-                continue
-
-            # Filter blocks that overlap with owned intervals
-            relevant_remote_blocks = self._filter_blocks_by_intervals(
-                remote_block_ids, owned_intervals, self.block_size
+            logger.info(
+                "[MULTI_RP] Starting transfer from RP rank %d (sub_req=%s)",
+                rp_rank, sub_request_id,
             )
 
-            if not relevant_remote_blocks:
-                logger.debug(
-                    "RP rank %s has no relevant blocks, skipping",
-                    rp_rank,
-                )
-                continue
-
-            logger.debug(
-                "Transferring from RP rank %s: %d blocks for intervals %s",
-                rp_rank,
-                len(relevant_remote_blocks),
-                owned_intervals,
+            # Transfer from this RP rank
+            # All ranks transfer to SAME local_block_ids (will combine after)
+            self._read_blocks(
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                dst_engine_id=dst_engine_id,
+                request_id=sub_request_id,  # Different sub-request ID
+                remote_rp_size=1,  # Disable recursion
+                remote_rp_rank=0,
+                seq_len=0,  # Disable multi-RP routing
             )
 
-            # NOTE: Current implementation transfers full blocks from each RP rank.
-            # Decoder should apply masking based on owned intervals to reconstruct
-            # the complete sequence. This is similar to allgather but distributed.
-            #
-            # TODO: Implement proper masking + reassembly logic here.
-            # For now, this is a placeholder that demonstrates the structure.
-            #
-            # Full implementation would require:
-            # 1. Transfer full blocks from this RP rank
-            # 2. Apply masking based on owned_intervals
-            # 3. Accumulate (SUM) masked results from all RP ranks
-            # 4. Store final result in local_block_ids
+        # Track multi-RP request for post-transfer reassembly
+        # When ALL sub-requests complete, apply masks and SUM
+        if not hasattr(self, '_multi_rp_pending'):
+            self._multi_rp_pending = {}
 
-            # Placeholder: Use legacy transfer for each RP rank
-            # In production, this would be replaced with parallel transfers + reassembly
-            logger.warning(
-                "Multi-RP transfer not fully implemented. "
-                "Falling back to legacy mode for request %s",
-                request_id,
-            )
-            # Fall back to legacy transfer from rp_rank=0
-            if rp_rank == 0:
-                self._read_blocks(
-                    local_block_ids=local_block_ids,
-                    remote_block_ids=remote_block_ids,
-                    dst_engine_id=dst_engine_id,
-                    request_id=request_id,
-                    remote_rp_size=remote_rp_size,
-                    remote_rp_rank=0,
-                    seq_len=seq_len,
-                )
-            return
+        self._multi_rp_pending[request_id] = {
+            'num_ranks': remote_rp_size,
+            'completed_ranks': [],
+            'local_block_ids': local_block_ids,
+            'seq_len': seq_len,
+            'sub_request_ids': [f"{request_id}:rp{i}" for i in range(remote_rp_size)],
+            'accumulator': None,  # Will store combined result
+        }
+
+        logger.info(
+            "[MULTI_RP] Initiated %d parallel transfers for request %s",
+            remote_rp_size, request_id,
+        )
 
     def get_mapped_blocks(self, block_ids, block_size_ratio):
         """
@@ -2719,6 +2764,122 @@ class NixlConnectorWorker:
                     break
 
         return filtered
+
+    def _apply_rp_mask_and_accumulate(
+        self,
+        parent_meta: dict,
+        rp_rank: int,
+        block_ids: list[int],
+        seq_len: int,
+        rp_size: int,
+    ):
+        """
+        Apply zigzag mask to transferred blocks and accumulate into parent's accumulator.
+        Same logic as _allgather_rp_kv but for decoder-side reassembly.
+        """
+
+        # Calculate owned intervals for this RP rank (zigzag pattern)
+        rp_align = 2 * rp_size
+        ring_chunk_len = (seq_len + rp_align - 1) // rp_align
+
+        head_start = ring_chunk_len * rp_rank
+        head_end = min(head_start + ring_chunk_len, seq_len)
+
+        tail_start = ring_chunk_len * (2 * rp_size - 1 - rp_rank)
+        tail_end = min(tail_start + ring_chunk_len, seq_len)
+
+        if head_start >= seq_len:
+            head_start = head_end = 0
+        if tail_start >= seq_len:
+            tail_start = tail_end = 0
+
+        logger.info(
+            "[MULTI_RP] RP rank %d owns intervals: head=[%d, %d), tail=[%d, %d)",
+            rp_rank, head_start, head_end, tail_start, tail_end,
+        )
+
+        # Apply masking to each layer's KV cache
+        for layer_name, cache in self.device_kv_caches.items():
+            if len(block_ids) == 0:
+                continue
+
+            # Get blocks (creates a view/copy)
+            selected_blocks = cache[block_ids]
+
+            # Create mask tensor
+            num_blocks = len(block_ids)
+            mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool, device=selected_blocks.device)
+
+            # Mark owned tokens in mask
+            for i in range(num_blocks):
+                block_start_token = i * self.block_size
+                block_end_token = block_start_token + self.block_size
+
+                # Head interval overlap
+                head_overlap_start = max(block_start_token, head_start)
+                head_overlap_end = min(block_end_token, head_end)
+                if head_overlap_end > head_overlap_start:
+                    m_start = head_overlap_start - block_start_token
+                    m_end = head_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+
+                # Tail interval overlap
+                tail_overlap_start = max(block_start_token, tail_start)
+                tail_overlap_end = min(block_end_token, tail_end)
+                if tail_overlap_end > tail_overlap_start:
+                    m_start = tail_overlap_start - block_start_token
+                    m_end = tail_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+
+            # Find block_size dimension
+            dims = selected_blocks.shape
+            block_dim_idx = -1
+            for idx, dim in enumerate(dims):
+                if dim == self.block_size:
+                    block_dim_idx = idx
+                    break
+
+            if block_dim_idx != -1:
+                # Reshape mask to match tensor shape
+                view_shape = [1] * len(dims)
+                view_shape[0] = num_blocks
+                view_shape[block_dim_idx] = self.block_size
+                mask = mask.view(view_shape)
+
+                # Apply mask: zero out non-owned tokens
+                selected_blocks = selected_blocks.clone()  # Make copy
+                selected_blocks.masked_fill_(~mask, 0)
+
+                # Accumulate into parent's accumulator
+                if parent_meta['accumulator'] is None:
+                    # First rank: initialize accumulator
+                    parent_meta['accumulator'] = {layer_name: selected_blocks.clone()}
+                    logger.info("[MULTI_RP] Initialized accumulator with rank %d data", rp_rank)
+                else:
+                    # Add to accumulator (SUM operation)
+                    if layer_name not in parent_meta['accumulator']:
+                        parent_meta['accumulator'][layer_name] = selected_blocks.clone()
+                    else:
+                        parent_meta['accumulator'][layer_name] += selected_blocks
+                    logger.info("[MULTI_RP] Added rank %d data to accumulator", rp_rank)
+
+    def _finalize_multi_rp_accumulation(self, parent_meta: dict, block_ids: list[int]):
+        """
+        Write accumulated result back to KV cache.
+        """
+        accumulator = parent_meta.get('accumulator')
+        if accumulator is None:
+            logger.error("[MULTI_RP] No accumulator found for finalization")
+            return
+
+        # Write accumulated result to KV cache
+        for layer_name, accumulated_blocks in accumulator.items():
+            if layer_name in self.device_kv_caches:
+                self.device_kv_caches[layer_name][block_ids] = accumulated_blocks
+                logger.info(
+                    "[MULTI_RP] Wrote accumulated result to layer %s (%d blocks)",
+                    layer_name, len(block_ids),
+                )
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
