@@ -507,7 +507,24 @@ class NixlConnectorScheduler:
                     continue
 
                 # Send response from 2D encoded_data structure
-                response_data = encoded_data[target_tp_rank][target_rp_rank]
+                # Fallback to rp_rank=0 if requested rp_rank not available (legacy mode)
+                try:
+                    response_data = encoded_data[target_tp_rank][target_rp_rank]
+                except KeyError:
+                    logger.debug(
+                        "RP rank %s not found for TP rank %s, falling back to rp_rank=0",
+                        target_rp_rank,
+                        target_tp_rank,
+                    )
+                    try:
+                        response_data = encoded_data[target_tp_rank][0]
+                    except KeyError:
+                        logger.error(
+                            "No metadata found for TP rank %s (requested RP rank %s)",
+                            target_tp_rank,
+                            target_rp_rank,
+                        )
+                        continue
                 sock.send_multipart((identity, b"", response_data))
 
     def get_num_new_matched_tokens(
