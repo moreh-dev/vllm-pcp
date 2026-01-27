@@ -1115,13 +1115,28 @@ class NixlConnectorWorker:
                     )
 
                 # Validate RP metadata
-                assert metadata.rp_size == remote_rp_size, (
-                    f"RP size mismatch: expected {remote_rp_size}, "
-                    f"got {metadata.rp_size}"
+                # Legacy mode: prefill has rp_size=1 or all metadata at rp_rank=0
+                # In this case, all RP rank requests get same metadata (rp_rank=0)
+                is_legacy_mode = metadata.rp_size <= 1 or (
+                    rp_rank > 0 and metadata.rp_rank == 0
                 )
-                assert metadata.rp_rank == rp_rank, (
-                    f"RP rank mismatch: expected {rp_rank}, got {metadata.rp_rank}"
-                )
+
+                if not is_legacy_mode:
+                    # Multi-RP mode: strict validation
+                    assert metadata.rp_size == remote_rp_size, (
+                        f"RP size mismatch: expected {remote_rp_size}, "
+                        f"got {metadata.rp_size}"
+                    )
+                    assert metadata.rp_rank == rp_rank, (
+                        f"RP rank mismatch: expected {rp_rank}, got {metadata.rp_rank}"
+                    )
+                else:
+                    # Legacy mode: accept rp_rank=0 for all requests
+                    if rp_rank > 0:
+                        logger.debug(
+                            "Legacy mode: Using rp_rank=0 metadata for rp_rank=%d request",
+                            rp_rank,
+                        )
 
                 # Register Remote agent
                 assert metadata.block_size <= self.block_size, "nP > nD is not supported yet."
@@ -1139,6 +1154,19 @@ class NixlConnectorWorker:
                     rp_rank,
                     setup_agent_time - got_metadata_time,
                 )
+
+                # Legacy mode optimization: If first handshake shows rp_size=1,
+                # all RP ranks will return same metadata. Fill and early exit.
+                if rp_rank == 0 and metadata.rp_size <= 1:
+                    logger.debug(
+                        "Legacy mode detected (rp_size=%d). "
+                        "Reusing rp_rank=0 agent for all RP ranks.",
+                        metadata.rp_size,
+                    )
+                    # Fill all remaining RP ranks with same agent
+                    for remaining_rp_rank in range(1, remote_rp_size):
+                        agents[p_remote_tp_rank][remaining_rp_rank] = remote_agent_name
+                    break  # Early exit, no need to handshake remaining ranks
 
         # Return {tp_rank: {rp_rank: agent_name}}
         return agents
