@@ -2969,18 +2969,23 @@ class NixlConnectorWorker:
                 before_mask_sum = selected_blocks.sum().item()
                 before_nonzero = (selected_blocks != 0).sum().item()
 
-                # Check what data exists at the masked positions BEFORE masking
+                # Check what data exists BEFORE masking - for first layer only
                 if num_blocks == 1 and layer_name == "model.layers.0.self_attn.attn":
-                    # Log first layer only for debugging
-                    mask_flat = mask.view(-1)
-                    blocks_flat = selected_blocks.view(-1)
-                    masked_positions = torch.where(mask_flat)[0]
+                    # Check which token positions have data (across block_size dimension)
+                    # blocks shape: [1, 128, 576] - check nonzero across dim 2
+                    token_has_data = (selected_blocks[0, :, :] != 0).any(dim=1)
+                    nonzero_token_positions = torch.where(token_has_data)[0]
+
+                    # Get mask true positions (2D mask before broadcast)
+                    mask_2d = mask.view(num_blocks, self.block_size)
+                    mask_true_positions = torch.where(mask_2d[0])[0]
+
                     logger.info(
-                        "[MULTI_RP] 🔍 RP_RANK=%d BEFORE mask: masked_positions=%s, "
-                        "values_at_masked_pos=%s, mask_shape=%s, blocks_shape=%s",
-                        rp_rank, masked_positions[:10].tolist(),
-                        blocks_flat[masked_positions[:10]].tolist() if len(masked_positions) > 0 else [],
-                        mask.shape, selected_blocks.shape,
+                        "[MULTI_RP] 🔍 RP_RANK=%d BEFORE mask: "
+                        "nonzero_tokens=%s, mask_tokens=%s, match=%s",
+                        rp_rank, nonzero_token_positions.tolist(),
+                        mask_true_positions.tolist(),
+                        (nonzero_token_positions.tolist() == mask_true_positions.tolist()),
                     )
 
                 selected_blocks = selected_blocks.clone()  # Make copy
