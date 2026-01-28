@@ -2879,9 +2879,10 @@ class NixlConnectorWorker:
         if tail_start >= seq_len:
             tail_start = tail_end = 0
 
-        logger.debug(
-            "[MULTI_RP] RP rank %d owns intervals: head=[%d, %d), tail=[%d, %d)",
-            rp_rank, head_start, head_end, tail_start, tail_end,
+        logger.info(
+            "[MULTI_RP] 🎯 Masking RP_RANK=%d: seq_len=%d, block_ids=%s, "
+            "head=[%d,%d), tail=[%d,%d), block_size=%d",
+            rp_rank, seq_len, block_ids, head_start, head_end, tail_start, tail_end, self.block_size,
         )
 
         # Apply masking to each layer's KV cache
@@ -2898,8 +2899,9 @@ class NixlConnectorWorker:
 
             # Mark owned tokens in mask
             for i, block_id in enumerate(block_ids):
-                # CRITICAL: Use actual block_id to calculate token position!
-                block_start_token = block_id * self.block_size
+                # i is the sequential block index (0, 1, 2, ...)
+                # This block contains tokens [i*block_size, (i+1)*block_size) in the sequence
+                block_start_token = i * self.block_size
                 block_end_token = block_start_token + self.block_size
 
                 # Head interval overlap
@@ -2909,6 +2911,12 @@ class NixlConnectorWorker:
                     m_start = head_overlap_start - block_start_token
                     m_end = head_overlap_end - block_start_token
                     mask[i, m_start:m_end] = True
+                    logger.info(
+                        "[MULTI_RP] 🎯 Mask HEAD: block_id=%d, block_tokens=[%d,%d), "
+                        "head_interval=[%d,%d) → mask[%d, %d:%d]=True",
+                        block_id, block_start_token, block_end_token,
+                        head_start, head_end, i, m_start, m_end,
+                    )
 
                 # Tail interval overlap
                 tail_overlap_start = max(block_start_token, tail_start)
@@ -2917,6 +2925,12 @@ class NixlConnectorWorker:
                     m_start = tail_overlap_start - block_start_token
                     m_end = tail_overlap_end - block_start_token
                     mask[i, m_start:m_end] = True
+                    logger.info(
+                        "[MULTI_RP] 🎯 Mask TAIL: block_id=%d, block_tokens=[%d,%d), "
+                        "tail_interval=[%d,%d) → mask[%d, %d:%d]=True",
+                        block_id, block_start_token, block_end_token,
+                        tail_start, tail_end, i, m_start, m_end,
+                    )
 
             # Find block_size dimension
             dims = selected_blocks.shape
@@ -2937,18 +2951,32 @@ class NixlConnectorWorker:
                 selected_blocks = selected_blocks.clone()  # Make copy
                 selected_blocks.masked_fill_(~mask, 0)
 
+                # Check mask - count True values
+                num_masked_tokens = mask.sum().item()
+                logger.info(
+                    "[MULTI_RP] 📊 RP_RANK=%d: %d/%d tokens masked (%.1f%%)",
+                    rp_rank, num_masked_tokens, num_blocks * self.block_size,
+                    100.0 * num_masked_tokens / (num_blocks * self.block_size),
+                )
+
                 # Accumulate into parent's accumulator
                 if parent_meta['accumulator'] is None:
                     # First rank: initialize accumulator
                     parent_meta['accumulator'] = {layer_name: selected_blocks.clone()}
-                    logger.debug("[MULTI_RP] Initialized accumulator with rank %d data", rp_rank)
+                    logger.info(
+                        "[MULTI_RP] ✅ Initialized accumulator with RP_RANK=%d (layer=%s, shape=%s)",
+                        rp_rank, layer_name, selected_blocks.shape,
+                    )
                 else:
                     # Add to accumulator (SUM operation)
                     if layer_name not in parent_meta['accumulator']:
                         parent_meta['accumulator'][layer_name] = selected_blocks.clone()
                     else:
                         parent_meta['accumulator'][layer_name] += selected_blocks
-                    logger.debug("[MULTI_RP] Added rank %d data to accumulator", rp_rank)
+                        logger.info(
+                            "[MULTI_RP] ➕ Added RP_RANK=%d to accumulator (layer=%s)",
+                            rp_rank, layer_name,
+                        )
 
     def _finalize_multi_rp_accumulation(self, parent_meta: dict, block_ids: list[int]):
         """
