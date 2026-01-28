@@ -145,7 +145,55 @@ RUN git clone https://github.com/feifeibear/long-context-attention.git \
     && MAX_JOBS=$(nproc) pip install . \
     && pip install peft==0.17.0 \
     && pip install xfuser \
-    && pip install quart hypercorn blinker --ignore-installed
+    && pip install quart hypercorn blinker --ignore-installed \
+    && ldconfig
+
+ARG UCX_VERSION=1.19.0
+
+RUN wget https://github.com/openucx/ucx/releases/download/v1.19.0/ucx-1.19.0.tar.gz \
+    && tar xzf ucx-1.19.0.tar.gz \
+    && cd ucx-1.19.0 \
+    && ./configure \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-devel-headers \
+        --with-rocm=/opt/rocm \
+        --with-verbs \
+        --with-dm \
+        --enable-mt \
+        --with-rc \
+        --with-rdmacm \
+        --with-mlx5 \
+    && make -j \
+    && make -j install-strip \
+    && ldconfig
+
+RUN pip install meson ninja pybind11
+COPY --from=nixl ./ /mnt/nixl
+RUN mkdir -p /usr/local/src/nixl \
+    && cd /usr/local/src/nixl \
+    && cp -r /mnt/nixl/* . \
+    && mkdir build \
+    && meson setup build/ --buildtype=release --prefix=/usr \
+    -Ducx_path=/usr/lib/ucx \
+    -Dcudapath_inc=/opt/rocm/include \
+    -Dcudapath_lib=/opt/rocm/lib \
+    -Ddisable_gds_backend=true \
+    -Dwerror=false \
+    && ninja -C build \
+    && ninja -C build install \
+    && ldconfig \
+    && pip install . \
+    --config-settings=setup-args="-Dcudapath_inc=/opt/rocm/include" \
+    --config-settings=setup-args="-Dcudapath_lib=/opt/rocm/lib" \
+    --config-settings=setup-args="-Ducx_path=/usr/lib/ucx" \
+    --config-settings=setup-args="-Ddisable_gds_backend=true" \
+    --config-settings=setup-args="-Dwerror=false" \
+    && rm -rf /usr/local/src/nixl
+
+ENV LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu/plugins/:/opt/nixl/lib:/usr/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
 
 ENV TOKENIZERS_PARALLELISM=false
 
