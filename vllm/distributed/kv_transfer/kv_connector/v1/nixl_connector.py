@@ -3174,8 +3174,12 @@ class NixlConnectorWorker:
                 view_shape[block_dim_idx] = self.block_size
                 mask = mask.view(view_shape)
 
-                # Apply mask IN-PLACE: zero out non-owned tokens
+                # Apply mask: zero out non-owned tokens
                 selected_blocks.masked_fill_(~mask, 0)
+
+                # CRITICAL: Write back to original cache!
+                # cache[block_ids] returns a COPY, so we must write it back
+                cache[block_ids] = selected_blocks
 
                 num_masked = mask.sum().item()
                 logger.info(
