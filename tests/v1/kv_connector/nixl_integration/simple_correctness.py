@@ -4,7 +4,7 @@ import openai
 BASE_URL = "http://localhost:8192/v1"
 MODEL_NAME = "/model/"
 MODEL_NAME="deepseek-ai/DeepSeek-V2-Lite"
-PROMPT = "John Deacon is a "
+PROMPT = "Typical Chinese breakfast includes "
 
 def run_simple_test():
     print(f"Connecting to {BASE_URL}...")
@@ -15,7 +15,7 @@ def run_simple_test():
         completion = client.completions.create(
             model=MODEL_NAME,
             prompt=PROMPT,
-            max_tokens=10,
+            max_tokens=30,
             temperature=0
         )
         
