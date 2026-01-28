@@ -1909,6 +1909,10 @@ class NixlConnectorWorker:
                         "req=%s, blocks=%d, seq_len=%d, size=%.2f MB",
                         self.rp_rank, req_id, num_blocks, seq_len, total_size_mb
                     )
+
+                    # CRITICAL: Apply zigzag mask IN-PLACE to zero out non-owned tokens
+                    # This ensures decode side receives data at correct GLOBAL positions
+                    self._mask_rp_blocks_inplace(meta.local_physical_block_ids, seq_len, self.rp_rank)
                 else:
                     # Phase 1: Perform allgather (fallback)
                     logger.debug("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
@@ -3089,6 +3093,96 @@ class NixlConnectorWorker:
             "[MULTI_RP] 💾 Finalization complete: Wrote %d/%d layers",
             written_count, len(accumulator),
         )
+
+    def _mask_rp_blocks_inplace(self, block_ids: list[int], seq_len: int, rp_rank: int) -> None:
+        """
+        Apply zigzag mask IN-PLACE to zero out non-owned tokens for this RP rank.
+        Used in Phase 2 multi-RP transfer on prefill side.
+
+        This ensures that when we send blocks, only owned tokens (at their GLOBAL positions)
+        contain data, and non-owned positions are zeroed out.
+        """
+        if self.rp_size <= 1 or seq_len == 0:
+            return
+
+        # Calculate owned intervals for this RP rank (zigzag pattern)
+        rp_align = 2 * self.rp_size
+        ring_chunk_len = (seq_len + rp_align - 1) // rp_align
+
+        head_start = ring_chunk_len * rp_rank
+        head_end = min(head_start + ring_chunk_len, seq_len)
+
+        tail_start = ring_chunk_len * (2 * self.rp_size - 1 - rp_rank)
+        tail_end = min(tail_start + ring_chunk_len, seq_len)
+
+        if head_start >= seq_len:
+            head_start = head_end = 0
+        if tail_start >= seq_len:
+            tail_start = tail_end = 0
+
+        logger.info(
+            "[PREFILL-MASK] 🎭 RP_RANK=%d masking: seq_len=%d, blocks=%s, "
+            "head=[%d,%d), tail=[%d,%d)",
+            rp_rank, seq_len, block_ids, head_start, head_end, tail_start, tail_end,
+        )
+
+        # Apply mask to each layer's KV cache IN-PLACE
+        for layer_name, cache in self.device_kv_caches.items():
+            if len(block_ids) == 0:
+                continue
+
+            # Get blocks - this is a VIEW, modifications affect original cache
+            selected_blocks = cache[block_ids]
+
+            # Construct a mask tensor
+            num_blocks = len(block_ids)
+            mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool, device=selected_blocks.device)
+
+            for i in range(num_blocks):
+                block_start_token = i * self.block_size
+                block_end_token = block_start_token + self.block_size
+
+                # Check intersection with head interval
+                head_overlap_start = max(block_start_token, head_start)
+                head_overlap_end = min(block_end_token, head_end)
+
+                if head_overlap_end > head_overlap_start:
+                    m_start = head_overlap_start - block_start_token
+                    m_end = head_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+
+                # Check intersection with tail interval
+                tail_overlap_start = max(block_start_token, tail_start)
+                tail_overlap_end = min(block_end_token, tail_end)
+
+                if tail_overlap_end > tail_overlap_start:
+                    m_start = tail_overlap_start - block_start_token
+                    m_end = tail_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+
+            # Find block_size dimension and reshape mask
+            dims = selected_blocks.shape
+            block_dim_idx = -1
+            for idx, dim in enumerate(dims):
+                if dim == self.block_size:
+                    block_dim_idx = idx
+                    break
+
+            if block_dim_idx != -1:
+                view_shape = [1] * len(dims)
+                view_shape[0] = num_blocks
+                view_shape[block_dim_idx] = self.block_size
+                mask = mask.view(view_shape)
+
+                # Apply mask IN-PLACE: zero out non-owned tokens
+                selected_blocks.masked_fill_(~mask, 0)
+
+                num_masked = mask.sum().item()
+                logger.info(
+                    "[PREFILL-MASK] ✅ RP_RANK=%d layer=%s: kept %d/%d tokens (%.1f%%)",
+                    rp_rank, layer_name, num_masked, num_blocks * self.block_size,
+                    100.0 * num_masked / (num_blocks * self.block_size),
+                )
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
