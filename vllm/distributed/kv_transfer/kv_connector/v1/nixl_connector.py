@@ -3096,11 +3096,12 @@ class NixlConnectorWorker:
 
     def _mask_rp_blocks_inplace(self, block_ids: list[int], seq_len: int, rp_rank: int) -> None:
         """
-        Apply zigzag mask IN-PLACE to zero out non-owned tokens for this RP rank.
-        Used in Phase 2 multi-RP transfer on prefill side.
+        Relocate KV data from LOCAL positions to GLOBAL positions before sending.
 
-        This ensures that when we send blocks, only owned tokens (at their GLOBAL positions)
-        contain data, and non-owned positions are zeroed out.
+        In Phase 2 multi-RP transfer:
+        - After ring attention, RP ranks store their owned tokens at LOCAL positions (0, 1, 2...)
+        - But decode side expects data at GLOBAL positions
+        - This function copies data from local→global positions and zeros out non-owned positions
         """
         if self.rp_size <= 1 or seq_len == 0:
             return
@@ -3120,47 +3121,34 @@ class NixlConnectorWorker:
         if tail_start >= seq_len:
             tail_start = tail_end = 0
 
+        # Build list of owned global positions
+        owned_global_positions = []
+        for pos in range(head_start, head_end):
+            owned_global_positions.append(pos)
+        for pos in range(tail_start, tail_end):
+            owned_global_positions.append(pos)
+
+        num_owned = len(owned_global_positions)
+
         logger.info(
-            "[PREFILL-MASK] 🎭 RP_RANK=%d masking: seq_len=%d, blocks=%s, "
-            "head=[%d,%d), tail=[%d,%d)",
-            rp_rank, seq_len, block_ids, head_start, head_end, tail_start, tail_end,
+            "[PREFILL-RELOCATE] 🎭 RP_RANK=%d: seq_len=%d, blocks=%d, "
+            "head=[%d,%d), tail=[%d,%d), owned=%d tokens at positions %s",
+            rp_rank, seq_len, len(block_ids), head_start, head_end, tail_start, tail_end,
+            num_owned, owned_global_positions[:10] if len(owned_global_positions) > 10 else owned_global_positions,
         )
 
-        # Apply mask to each layer's KV cache IN-PLACE
+        # Apply relocation to each layer's KV cache
         for layer_name, cache in self.device_kv_caches.items():
-            if len(block_ids) == 0:
+            if len(block_ids) == 0 or num_owned == 0:
                 continue
 
-            # Get blocks - this is a VIEW, modifications affect original cache
+            # Get original blocks
             selected_blocks = cache[block_ids]
 
-            # Construct a mask tensor
-            num_blocks = len(block_ids)
-            mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool, device=selected_blocks.device)
+            # Create a new zero-filled tensor
+            relocated_blocks = torch.zeros_like(selected_blocks)
 
-            for i in range(num_blocks):
-                block_start_token = i * self.block_size
-                block_end_token = block_start_token + self.block_size
-
-                # Check intersection with head interval
-                head_overlap_start = max(block_start_token, head_start)
-                head_overlap_end = min(block_end_token, head_end)
-
-                if head_overlap_end > head_overlap_start:
-                    m_start = head_overlap_start - block_start_token
-                    m_end = head_overlap_end - block_start_token
-                    mask[i, m_start:m_end] = True
-
-                # Check intersection with tail interval
-                tail_overlap_start = max(block_start_token, tail_start)
-                tail_overlap_end = min(block_end_token, tail_end)
-
-                if tail_overlap_end > tail_overlap_start:
-                    m_start = tail_overlap_start - block_start_token
-                    m_end = tail_overlap_end - block_start_token
-                    mask[i, m_start:m_end] = True
-
-            # Find block_size dimension and reshape mask
+            # Find the block_size dimension
             dims = selected_blocks.shape
             block_dim_idx = -1
             for idx, dim in enumerate(dims):
@@ -3168,25 +3156,52 @@ class NixlConnectorWorker:
                     block_dim_idx = idx
                     break
 
-            if block_dim_idx != -1:
-                view_shape = [1] * len(dims)
-                view_shape[0] = num_blocks
-                view_shape[block_dim_idx] = self.block_size
-                mask = mask.view(view_shape)
-
-                # Apply mask: zero out non-owned tokens
-                selected_blocks.masked_fill_(~mask, 0)
-
-                # CRITICAL: Write back to original cache!
-                # cache[block_ids] returns a COPY, so we must write it back
-                cache[block_ids] = selected_blocks
-
-                num_masked = mask.sum().item()
-                logger.info(
-                    "[PREFILL-MASK] ✅ RP_RANK=%d layer=%s: kept %d/%d tokens (%.1f%%)",
-                    rp_rank, layer_name, num_masked, num_blocks * self.block_size,
-                    100.0 * num_masked / (num_blocks * self.block_size),
+            if block_dim_idx == -1:
+                logger.warning(
+                    "[PREFILL-RELOCATE] ⚠️ Could not find block_size dimension in shape %s",
+                    dims,
                 )
+                continue
+
+            # Copy data from LOCAL positions to GLOBAL positions
+            for local_idx, global_pos in enumerate(owned_global_positions):
+                if global_pos >= seq_len:
+                    break
+
+                # Calculate block and position indices
+                local_block_idx = local_idx // self.block_size
+                local_pos_in_block = local_idx % self.block_size
+
+                global_block_idx = global_pos // self.block_size
+                global_pos_in_block = global_pos % self.block_size
+
+                if local_block_idx >= len(block_ids) or global_block_idx >= len(block_ids):
+                    continue
+
+                # Copy data: local → global
+                # Handle different tensor layouts
+                if block_dim_idx == 2:
+                    # Common layout: [num_blocks, num_heads, block_size, head_size]
+                    relocated_blocks[global_block_idx, :, global_pos_in_block, :] = \
+                        selected_blocks[local_block_idx, :, local_pos_in_block, :]
+                elif block_dim_idx == 1:
+                    # Layout: [num_blocks, block_size, ...]
+                    relocated_blocks[global_block_idx, global_pos_in_block] = \
+                        selected_blocks[local_block_idx, local_pos_in_block]
+                else:
+                    logger.warning(
+                        "[PREFILL-RELOCATE] ⚠️ Unexpected block_dim_idx=%d in shape %s",
+                        block_dim_idx, dims,
+                    )
+                    continue
+
+            # Write back to cache
+            cache[block_ids] = relocated_blocks
+
+            logger.info(
+                "[PREFILL-RELOCATE] ✅ RP_RANK=%d layer=%s: relocated %d tokens from local→global positions",
+                rp_rank, layer_name, num_owned,
+            )
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
