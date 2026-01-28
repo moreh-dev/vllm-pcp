@@ -2948,34 +2948,44 @@ class NixlConnectorWorker:
                 mask = mask.view(view_shape)
 
                 # Apply mask: zero out non-owned tokens
+                before_mask_sum = selected_blocks.sum().item()
                 selected_blocks = selected_blocks.clone()  # Make copy
                 selected_blocks.masked_fill_(~mask, 0)
+                after_mask_sum = selected_blocks.sum().item()
 
                 # Check mask - count True values
                 num_masked_tokens = mask.sum().item()
+                num_nonzero = (selected_blocks != 0).sum().item()
                 logger.info(
-                    "[MULTI_RP] 📊 RP_RANK=%d: %d/%d tokens masked (%.1f%%)",
-                    rp_rank, num_masked_tokens, num_blocks * self.block_size,
+                    "[MULTI_RP] 📊 RP_RANK=%d layer=%s: %d/%d tokens kept (%.1f%%), "
+                    "sum: %.2f → %.2f, nonzero_elements=%d",
+                    rp_rank, layer_name, num_masked_tokens, num_blocks * self.block_size,
                     100.0 * num_masked_tokens / (num_blocks * self.block_size),
+                    before_mask_sum, after_mask_sum, num_nonzero,
                 )
 
                 # Accumulate into parent's accumulator
                 if parent_meta['accumulator'] is None:
                     # First rank: initialize accumulator
                     parent_meta['accumulator'] = {layer_name: selected_blocks.clone()}
+                    init_sum = selected_blocks.sum().item()
                     logger.info(
-                        "[MULTI_RP] ✅ Initialized accumulator with RP_RANK=%d (layer=%s, shape=%s)",
-                        rp_rank, layer_name, selected_blocks.shape,
+                        "[MULTI_RP] ✅ Initialized accumulator with RP_RANK=%d (layer=%s, shape=%s, sum=%.2f)",
+                        rp_rank, layer_name, selected_blocks.shape, init_sum,
                     )
                 else:
                     # Add to accumulator (SUM operation)
                     if layer_name not in parent_meta['accumulator']:
                         parent_meta['accumulator'][layer_name] = selected_blocks.clone()
                     else:
+                        before_accum = parent_meta['accumulator'][layer_name].sum().item()
+                        to_add_sum = selected_blocks.sum().item()
                         parent_meta['accumulator'][layer_name] += selected_blocks
+                        after_accum = parent_meta['accumulator'][layer_name].sum().item()
                         logger.info(
-                            "[MULTI_RP] ➕ Added RP_RANK=%d to accumulator (layer=%s)",
-                            rp_rank, layer_name,
+                            "[MULTI_RP] ➕ Added RP_RANK=%d to accumulator (layer=%s): "
+                            "before=%.2f + adding=%.2f → after=%.2f",
+                            rp_rank, layer_name, before_accum, to_add_sum, after_accum,
                         )
 
     def _finalize_multi_rp_accumulation(self, parent_meta: dict, block_ids: list[int]):
@@ -2996,15 +3006,39 @@ class NixlConnectorWorker:
         written_count = 0
         for layer_name, accumulated_blocks in accumulator.items():
             if layer_name in self.device_kv_caches:
-                # Get before/after for debugging
-                before_sum = self.device_kv_caches[layer_name][block_ids].sum().item()
+                # Get detailed diagnostics
+                cache_blocks = self.device_kv_caches[layer_name][block_ids]
+                before_sum = cache_blocks.sum().item()
+                accum_sum = accumulated_blocks.sum().item()
+
+                # Check if they're the same object
+                same_data = torch.equal(cache_blocks, accumulated_blocks)
+
+                # Log detailed info for first 2 layers
+                if written_count < 2:
+                    logger.info(
+                        "[MULTI_RP] 💾 BEFORE write layer %s: "
+                        "cache_sum=%.2f, accum_sum=%.2f, same_data=%s, "
+                        "cache_shape=%s, accum_shape=%s, "
+                        "cache_device=%s, accum_device=%s",
+                        layer_name, before_sum, accum_sum, same_data,
+                        cache_blocks.shape, accumulated_blocks.shape,
+                        cache_blocks.device, accumulated_blocks.device,
+                    )
+
+                # Perform the write
                 self.device_kv_caches[layer_name][block_ids] = accumulated_blocks
+
+                # Verify write happened
                 after_sum = self.device_kv_caches[layer_name][block_ids].sum().item()
+                write_success = abs(after_sum - accum_sum) < 0.01
+
                 written_count += 1
                 if written_count <= 2:  # Only log first 2 layers
                     logger.info(
-                        "[MULTI_RP] 💾 Wrote layer %s: block_ids=%s, before_sum=%.2f, after_sum=%.2f",
-                        layer_name, block_ids, before_sum, after_sum,
+                        "[MULTI_RP] 💾 AFTER write layer %s: "
+                        "after_sum=%.2f, expected=%.2f, write_success=%s",
+                        layer_name, after_sum, accum_sum, write_success,
                     )
             else:
                 logger.error(
