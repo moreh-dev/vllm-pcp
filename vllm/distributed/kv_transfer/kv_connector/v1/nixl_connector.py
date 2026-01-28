@@ -1867,15 +1867,15 @@ class NixlConnectorWorker:
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
         """copy kv from device to host buffer or gather kv from remote ranks."""
 
-        logger.info("[SAVE_KV] save_kv_to_host called with %d requests", len(metadata.reqs_to_save))
+        logger.debug("[SAVE_KV] save_kv_to_host called with %d requests", len(metadata.reqs_to_save))
 
         # Determine if we need to copy to host
         do_host_copy = self.use_host_buffer and self.copy_blocks is not None
-        logger.info("[SAVE_KV] do_host_copy=%s, rp_size=%d, rp_rank=%d",
+        logger.debug("[SAVE_KV] do_host_copy=%s, rp_size=%d, rp_rank=%d",
                    do_host_copy, self.rp_size, self.rp_rank)
 
         for req_id, meta in metadata.reqs_to_save.items():
-            logger.info("[SAVE_KV] Processing request %s with %d blocks",
+            logger.debug("[SAVE_KV] Processing request %s with %d blocks",
                        req_id, len(meta.local_block_ids))
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -1883,14 +1883,36 @@ class NixlConnectorWorker:
 
             # 1. Gather KV from Ring Parallel ranks to Rank 0 (if needed)
             if self.rp_size > 1:
-                logger.info(
+                multi_rp_enabled = envs.VLLM_ENABLE_MULTI_RP_TRANSFER
+                logger.debug(
                     "[SAVE_KV] RP size > 1 detected. multi_rp_enabled=%s",
-                    envs.VLLM_ENABLE_MULTI_RP_TRANSFER
+                    multi_rp_enabled
                 )
-                # Always perform allgather for now
-                # TODO: Skip allgather when sequential multi-RP transfer is implemented
-                logger.info("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
-                self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
+
+                if multi_rp_enabled:
+                    # Phase 2: Each RP rank sends PARTIAL data only (no allgather!)
+                    seq_len = getattr(meta, "seq_len", 0)
+                    num_blocks = len(meta.local_physical_block_ids)
+
+                    # Calculate size
+                    if self.device_kv_caches:
+                        sample_cache = list(self.device_kv_caches.values())[0]
+                        if isinstance(sample_cache, (list, tuple)):
+                            sample_cache = sample_cache[0]
+                        block_size_bytes = sample_cache[0].element_size() * sample_cache[0].numel()
+                        total_size_mb = (block_size_bytes * num_blocks) / (1024 * 1024)
+                    else:
+                        total_size_mb = 0
+
+                    logger.info(
+                        "[PREFILL-SEND] 🔵 RP_RANK=%d sending PARTIAL KV: "
+                        "req=%s, blocks=%d, seq_len=%d, size=%.2f MB",
+                        self.rp_rank, req_id, num_blocks, seq_len, total_size_mb
+                    )
+                else:
+                    # Phase 1: Perform allgather (fallback)
+                    logger.debug("[SAVE_KV] Calling _allgather_rp_kv for request %s", req_id)
+                    self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -2176,8 +2198,8 @@ class NixlConnectorWorker:
         num_ranks = parent_meta['num_ranks']
 
         logger.info(
-            "[MULTI_RP] Sub-request %s completed (parent=%s, rp_rank=%d, %d/%d ranks)",
-            sub_request_id, parent_request_id, rp_rank,
+            "[DECODE-RECV] ✅ Completed from RP_RANK=%d: req=%s (%d/%d ranks done)",
+            rp_rank, parent_request_id,
             len(parent_meta['completed_ranks']) + 1, num_ranks,
         )
 
@@ -2194,8 +2216,8 @@ class NixlConnectorWorker:
             # SEQUENTIAL TRANSFER: Start next RP rank
             next_rp_rank = parent_meta['pending_rp_ranks'].pop(0)
             logger.info(
-                "[MULTI_RP] Rank %d done. Starting next rank=%d (remaining=%s)",
-                rp_rank, next_rp_rank, parent_meta['pending_rp_ranks'],
+                "[DECODE-RECV] 🔄 RP_RANK=%d done → Starting RP_RANK=%d (remaining=%d)",
+                rp_rank, next_rp_rank, len(parent_meta['pending_rp_ranks']),
             )
 
             self._start_rp_rank_transfer(
@@ -2209,7 +2231,7 @@ class NixlConnectorWorker:
         elif len(parent_meta['completed_ranks']) == num_ranks:
             # All ranks completed
             logger.info(
-                "[MULTI_RP] All %d ranks completed for parent request %s - reassembly done",
+                "[DECODE-RECV] 🎉 ALL %d RP ranks completed for req=%s - Reassembly DONE",
                 num_ranks, parent_request_id,
             )
             # Write accumulated result to KV cache
@@ -2239,7 +2261,7 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
-        logger.info("[START_LOAD] start_load_kv called with %d requests to receive", len(metadata.reqs_to_recv))
+        logger.debug("[START_LOAD] start_load_kv called with %d requests to receive", len(metadata.reqs_to_recv))
 
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
@@ -2249,7 +2271,7 @@ class NixlConnectorWorker:
                 meta.remote_block_ids
             )
             remote_engine_id = meta.remote_engine_id
-            logger.info(
+            logger.debug(
                 "[START_LOAD] Processing request %s from remote engine %s: "
                 "%d local blocks, %d remote blocks",
                 req_id,
@@ -2554,7 +2576,7 @@ class NixlConnectorWorker:
         5. Repeat for all ranks
         6. Final result = SUM of all masked partials = complete KV
         """
-        logger.info(
+        logger.debug(
             "[MULTI_RP] Multi-RP transfer: request=%s, seq_len=%d, rp_size=%d, blocks=%d",
             request_id,
             seq_len,
@@ -2582,7 +2604,7 @@ class NixlConnectorWorker:
             'pending_rp_ranks': list(range(1, remote_rp_size)),  # Ranks to transfer
         }
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] Phase 2: Sequential transfer initiated. "
             "Starting with rank=0, pending ranks=%s",
             self._multi_rp_pending[request_id]['pending_rp_ranks'],
@@ -2599,7 +2621,7 @@ class NixlConnectorWorker:
             remote_tp_rank=remote_tp_rank,
         )
 
-        logger.info("[MULTI_RP] Transfer initiated from rank=0 (sequential mode)")
+        logger.debug("[MULTI_RP] Transfer initiated from rank=0 (sequential mode)")
 
     def _start_rp_rank_transfer(
         self,
@@ -2634,9 +2656,22 @@ class NixlConnectorWorker:
         # Create sub-request ID with RP rank suffix
         sub_request_id = f"{parent_request_id}:rp{rp_rank}"
 
+        # Calculate transfer size
+        num_local_blocks = len(local_block_ids)
+        num_remote_blocks = len(remote_block_ids)
+        if self.device_kv_caches:
+            sample_cache = list(self.device_kv_caches.values())[0]
+            if isinstance(sample_cache, (list, tuple)):
+                sample_cache = sample_cache[0]
+            block_size_bytes = sample_cache[0].element_size() * sample_cache[0].numel()
+            total_size_mb = (block_size_bytes * num_remote_blocks) / (1024 * 1024)
+        else:
+            total_size_mb = 0
+
         logger.info(
-            "[MULTI_RP] Starting transfer: sub_req=%s, parent=%s, rp_rank=%d",
-            sub_request_id, parent_request_id, rp_rank,
+            "[DECODE-RECV] 🟢 Starting transfer from RP_RANK=%d: "
+            "req=%s, local_blocks=%d, remote_blocks=%d, size=%.2f MB",
+            rp_rank, parent_request_id, num_local_blocks, num_remote_blocks, total_size_mb
         )
 
         # Call _read_blocks with sub-request ID
@@ -2651,7 +2686,7 @@ class NixlConnectorWorker:
             seq_len=0,  # Disable multi-RP routing
         )
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] Transfer started for rank=%d (sub_req=%s)",
             rp_rank, sub_request_id,
         )
@@ -2844,7 +2879,7 @@ class NixlConnectorWorker:
         if tail_start >= seq_len:
             tail_start = tail_end = 0
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] RP rank %d owns intervals: head=[%d, %d), tail=[%d, %d)",
             rp_rank, head_start, head_end, tail_start, tail_end,
         )
@@ -2905,14 +2940,14 @@ class NixlConnectorWorker:
                 if parent_meta['accumulator'] is None:
                     # First rank: initialize accumulator
                     parent_meta['accumulator'] = {layer_name: selected_blocks.clone()}
-                    logger.info("[MULTI_RP] Initialized accumulator with rank %d data", rp_rank)
+                    logger.debug("[MULTI_RP] Initialized accumulator with rank %d data", rp_rank)
                 else:
                     # Add to accumulator (SUM operation)
                     if layer_name not in parent_meta['accumulator']:
                         parent_meta['accumulator'][layer_name] = selected_blocks.clone()
                     else:
                         parent_meta['accumulator'][layer_name] += selected_blocks
-                    logger.info("[MULTI_RP] Added rank %d data to accumulator", rp_rank)
+                    logger.debug("[MULTI_RP] Added rank %d data to accumulator", rp_rank)
 
     def _finalize_multi_rp_accumulation(self, parent_meta: dict, block_ids: list[int]):
         """
@@ -2927,7 +2962,7 @@ class NixlConnectorWorker:
         for layer_name, accumulated_blocks in accumulator.items():
             if layer_name in self.device_kv_caches:
                 self.device_kv_caches[layer_name][block_ids] = accumulated_blocks
-                logger.info(
+                logger.debug(
                     "[MULTI_RP] Wrote accumulated result to layer %s (%d blocks)",
                     layer_name, len(block_ids),
                 )
