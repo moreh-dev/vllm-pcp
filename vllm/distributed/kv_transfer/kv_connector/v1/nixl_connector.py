@@ -2897,8 +2897,9 @@ class NixlConnectorWorker:
             mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool, device=selected_blocks.device)
 
             # Mark owned tokens in mask
-            for i in range(num_blocks):
-                block_start_token = i * self.block_size
+            for i, block_id in enumerate(block_ids):
+                # CRITICAL: Use actual block_id to calculate token position!
+                block_start_token = block_id * self.block_size
                 block_end_token = block_start_token + self.block_size
 
                 # Head interval overlap
