@@ -2984,17 +2984,38 @@ class NixlConnectorWorker:
         """
         accumulator = parent_meta.get('accumulator')
         if accumulator is None:
-            logger.error("[MULTI_RP] No accumulator found for finalization")
+            logger.error("[MULTI_RP] ❌ No accumulator found for finalization")
             return
 
+        logger.info(
+            "[MULTI_RP] 💾 Finalizing: Writing %d layers to block_ids=%s",
+            len(accumulator), block_ids,
+        )
+
         # Write accumulated result to KV cache
+        written_count = 0
         for layer_name, accumulated_blocks in accumulator.items():
             if layer_name in self.device_kv_caches:
+                # Get before/after for debugging
+                before_sum = self.device_kv_caches[layer_name][block_ids].sum().item()
                 self.device_kv_caches[layer_name][block_ids] = accumulated_blocks
-                logger.debug(
-                    "[MULTI_RP] Wrote accumulated result to layer %s (%d blocks)",
-                    layer_name, len(block_ids),
+                after_sum = self.device_kv_caches[layer_name][block_ids].sum().item()
+                written_count += 1
+                if written_count <= 2:  # Only log first 2 layers
+                    logger.info(
+                        "[MULTI_RP] 💾 Wrote layer %s: block_ids=%s, before_sum=%.2f, after_sum=%.2f",
+                        layer_name, block_ids, before_sum, after_sum,
+                    )
+            else:
+                logger.error(
+                    "[MULTI_RP] ❌ Layer %s not found in device_kv_caches!",
+                    layer_name,
                 )
+
+        logger.info(
+            "[MULTI_RP] 💾 Finalization complete: Wrote %d/%d layers",
+            written_count, len(accumulator),
+        )
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
