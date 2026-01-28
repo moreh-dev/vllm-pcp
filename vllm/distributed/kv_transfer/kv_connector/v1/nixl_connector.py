@@ -3103,7 +3103,16 @@ class NixlConnectorWorker:
         - But decode side expects data at GLOBAL positions
         - This function copies data from local→global positions and zeros out non-owned positions
         """
+        logger.info(
+            "[PREFILL-RELOCATE] 🚀 ENTRY: rp_rank=%d, seq_len=%d, rp_size=%d, num_blocks=%d",
+            rp_rank, seq_len, self.rp_size, len(block_ids),
+        )
+
         if self.rp_size <= 1 or seq_len == 0:
+            logger.warning(
+                "[PREFILL-RELOCATE] ⚠️ EARLY RETURN: rp_size=%d, seq_len=%d",
+                self.rp_size, seq_len,
+            )
             return
 
         # Calculate owned intervals for this RP rank (zigzag pattern)
@@ -3163,6 +3172,17 @@ class NixlConnectorWorker:
                 )
                 continue
 
+            # BEFORE relocation: check where data is
+            if block_dim_idx == 2:
+                original_nonzero = []
+                for pos_idx in range(min(10, selected_blocks.shape[block_dim_idx])):
+                    if selected_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
+                        original_nonzero.append(pos_idx)
+                logger.info(
+                    "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s BEFORE: nonzero_positions=%s (should be local [0,1,...])",
+                    rp_rank, layer_name, original_nonzero[:10],
+                )
+
             # Copy data from LOCAL positions to GLOBAL positions
             for local_idx, global_pos in enumerate(owned_global_positions):
                 if global_pos >= seq_len:
@@ -3195,8 +3215,31 @@ class NixlConnectorWorker:
                     )
                     continue
 
+            # AFTER relocation: verify data moved
+            if block_dim_idx == 2:
+                relocated_nonzero = []
+                for pos_idx in range(min(10, relocated_blocks.shape[block_dim_idx])):
+                    if relocated_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
+                        relocated_nonzero.append(pos_idx)
+                logger.info(
+                    "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s AFTER: nonzero_positions=%s (should be global %s)",
+                    rp_rank, layer_name, relocated_nonzero[:10], owned_global_positions[:10],
+                )
+
             # Write back to cache
             cache[block_ids] = relocated_blocks
+
+            # VERIFY write-back worked
+            if block_dim_idx == 2:
+                verify_blocks = cache[block_ids]
+                verify_nonzero = []
+                for pos_idx in range(min(10, verify_blocks.shape[block_dim_idx])):
+                    if verify_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
+                        verify_nonzero.append(pos_idx)
+                logger.info(
+                    "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s VERIFY: nonzero_positions=%s (read back from cache)",
+                    rp_rank, layer_name, verify_nonzero[:10],
+                )
 
             logger.info(
                 "[PREFILL-RELOCATE] ✅ RP_RANK=%d layer=%s: relocated %d tokens from local→global positions",
