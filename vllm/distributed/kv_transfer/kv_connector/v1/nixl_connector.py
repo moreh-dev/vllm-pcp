@@ -2146,6 +2146,7 @@ class NixlConnectorWorker:
         """
         Handle completion of a multi-RP sub-request.
         Apply masking and accumulate into parent request's result.
+        Schedule next RP rank transfer if pending.
 
         Args:
             sub_request_id: Sub-request ID (format: "parent_id:rpN")
@@ -2188,8 +2189,25 @@ class NixlConnectorWorker:
         # Mark this rank as completed
         parent_meta['completed_ranks'].append(rp_rank)
 
-        # Check if all ranks completed
-        if len(parent_meta['completed_ranks']) == num_ranks:
+        # Check if there are more pending RP ranks to transfer
+        if parent_meta['pending_rp_ranks']:
+            # SEQUENTIAL TRANSFER: Start next RP rank
+            next_rp_rank = parent_meta['pending_rp_ranks'].pop(0)
+            logger.info(
+                "[MULTI_RP] Rank %d done. Starting next rank=%d (remaining=%s)",
+                rp_rank, next_rp_rank, parent_meta['pending_rp_ranks'],
+            )
+
+            self._start_rp_rank_transfer(
+                parent_request_id=parent_request_id,
+                rp_rank=next_rp_rank,
+                local_block_ids=local_block_ids,
+                remote_block_ids=parent_meta['remote_block_ids'],
+                dst_engine_id=parent_meta['dst_engine_id'],
+                remote_tp_rank=parent_meta['remote_tp_rank'],
+            )
+        elif len(parent_meta['completed_ranks']) == num_ranks:
+            # All ranks completed
             logger.info(
                 "[MULTI_RP] All %d ranks completed for parent request %s - reassembly done",
                 num_ranks, parent_request_id,
@@ -2528,11 +2546,11 @@ class NixlConnectorWorker:
         Each RP rank has partial KV (their owned tokens only).
         Decoder receives from ALL ranks sequentially and combines on GPU.
 
-        Strategy:
+        Strategy (PHASE 2 - Sequential Transfer):
         1. Transfer from rank=0 → stores in local_block_ids (partial data)
-        2. Apply mask to zero out non-owned tokens
+        2. Apply mask to zero out non-owned tokens → ACCUMULATE
         3. Transfer from rank=1 → stores in same local_block_ids (overwrites!)
-        4. Apply mask + ADD to previous result
+        4. Apply mask + ADD to previous result → ACCUMULATE
         5. Repeat for all ranks
         6. Final result = SUM of all masked partials = complete KV
         """
@@ -2547,17 +2565,59 @@ class NixlConnectorWorker:
         # Get target TP rank
         remote_tp_rank = self.kv_topo.get_target_remote_rank_from_engine_id(dst_engine_id)
 
-        # CRITICAL: Cannot do parallel transfers to same buffer!
-        # All RP ranks would overwrite each other → race condition
-        # Solution: Transfer ONLY from rank=0, but ensure prefill does allgather
-        #
-        # TODO: For true optimization, need separate temp buffers per rank
-        # or wait for each transfer to complete before starting next
+        # Initialize multi-RP state machine
+        if not hasattr(self, '_multi_rp_pending'):
+            self._multi_rp_pending = {}
 
-        # For now: Use rank=0 only (which has allgathered full data)
-        rp_rank = 0
+        # Setup parent request metadata for sequential transfer
+        self._multi_rp_pending[request_id] = {
+            'local_block_ids': local_block_ids,
+            'remote_block_ids': remote_block_ids,
+            'seq_len': seq_len,
+            'num_ranks': remote_rp_size,
+            'dst_engine_id': dst_engine_id,
+            'remote_tp_rank': remote_tp_rank,
+            'completed_ranks': [],
+            'accumulator': None,  # Will store accumulated KV data
+            'pending_rp_ranks': list(range(1, remote_rp_size)),  # Ranks to transfer
+        }
 
-        # Verify agent exists
+        logger.info(
+            "[MULTI_RP] Phase 2: Sequential transfer initiated. "
+            "Starting with rank=0, pending ranks=%s",
+            self._multi_rp_pending[request_id]['pending_rp_ranks'],
+        )
+
+        # Start transfer from FIRST rank only (rank=0)
+        # Subsequent ranks will be started in _schedule_next_rp_transfer()
+        self._start_rp_rank_transfer(
+            parent_request_id=request_id,
+            rp_rank=0,
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            dst_engine_id=dst_engine_id,
+            remote_tp_rank=remote_tp_rank,
+        )
+
+        logger.info("[MULTI_RP] Transfer initiated from rank=0 (sequential mode)")
+
+    def _start_rp_rank_transfer(
+        self,
+        parent_request_id: str,
+        rp_rank: int,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        dst_engine_id: str,
+        remote_tp_rank: int,
+    ) -> None:
+        """
+        Start a transfer for a specific RP rank.
+
+        Creates a sub-request with ID format: "parent_id:rpN"
+        The completion will be detected in _pop_done_transfers() which calls
+        _handle_multi_rp_completion() to apply mask+accumulate and schedule next.
+        """
+        # Verify agent exists for this RP rank
         if dst_engine_id not in self._remote_agents or \
            remote_tp_rank not in self._remote_agents[dst_engine_id] or \
            rp_rank not in self._remote_agents[dst_engine_id][remote_tp_rank]:
@@ -2565,24 +2625,36 @@ class NixlConnectorWorker:
                 "[MULTI_RP] Agent not found: engine=%s, TP=%s, RP=%s",
                 dst_engine_id, remote_tp_rank, rp_rank,
             )
+            # Mark transfer as failed
+            if parent_request_id in self._multi_rp_pending:
+                del self._multi_rp_pending[parent_request_id]
+            self._failed_recv_reqs.add(parent_request_id)
             return
 
+        # Create sub-request ID with RP rank suffix
+        sub_request_id = f"{parent_request_id}:rp{rp_rank}"
+
         logger.info(
-            "[MULTI_RP] Transferring from RP rank=0 (has allgathered data)",
+            "[MULTI_RP] Starting transfer: sub_req=%s, parent=%s, rp_rank=%d",
+            sub_request_id, parent_request_id, rp_rank,
         )
 
-        # Transfer from rank 0
+        # Call _read_blocks with sub-request ID
+        # Disable multi-RP recursion by setting remote_rp_size=1
         self._read_blocks(
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
             dst_engine_id=dst_engine_id,
-            request_id=request_id,
+            request_id=sub_request_id,  # Use sub-request ID!
             remote_rp_size=1,  # Disable recursion
-            remote_rp_rank=0,
+            remote_rp_rank=rp_rank,
             seq_len=0,  # Disable multi-RP routing
         )
 
-        logger.info("[MULTI_RP] Transfer initiated from rank=0")
+        logger.info(
+            "[MULTI_RP] Transfer started for rank=%d (sub_req=%s)",
+            rp_rank, sub_request_id,
+        )
 
     def get_mapped_blocks(self, block_ids, block_size_ratio):
         """
