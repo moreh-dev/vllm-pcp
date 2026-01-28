@@ -2945,23 +2945,57 @@ class NixlConnectorWorker:
                 view_shape = [1] * len(dims)
                 view_shape[0] = num_blocks
                 view_shape[block_dim_idx] = self.block_size
+
+                # Log mask before reshape for first layer
+                if layer_name == "model.layers.0.self_attn.attn":
+                    mask_2d = mask.view(num_blocks, self.block_size)
+                    true_positions = torch.where(mask_2d[0])[0] if num_blocks > 0 else torch.tensor([])
+                    logger.info(
+                        "[MULTI_RP] 🎭 RP_RANK=%d mask before reshape: shape=%s, true_positions=%s",
+                        rp_rank, mask.shape, true_positions.tolist()[:20],
+                    )
+
                 mask = mask.view(view_shape)
+
+                # Log mask after reshape
+                if layer_name == "model.layers.0.self_attn.attn":
+                    logger.info(
+                        "[MULTI_RP] 🎭 RP_RANK=%d mask after reshape: shape=%s → %s, "
+                        "block_dim_idx=%d, tensor_dims=%s",
+                        rp_rank, (num_blocks, self.block_size), view_shape, block_dim_idx, dims,
+                    )
 
                 # Apply mask: zero out non-owned tokens
                 before_mask_sum = selected_blocks.sum().item()
+                before_nonzero = (selected_blocks != 0).sum().item()
+
+                # Check what data exists at the masked positions BEFORE masking
+                if num_blocks == 1 and layer_name == "model.layers.0.self_attn.attn":
+                    # Log first layer only for debugging
+                    mask_flat = mask.view(-1)
+                    blocks_flat = selected_blocks.view(-1)
+                    masked_positions = torch.where(mask_flat)[0]
+                    logger.info(
+                        "[MULTI_RP] 🔍 RP_RANK=%d BEFORE mask: masked_positions=%s, "
+                        "values_at_masked_pos=%s, mask_shape=%s, blocks_shape=%s",
+                        rp_rank, masked_positions[:10].tolist(),
+                        blocks_flat[masked_positions[:10]].tolist() if len(masked_positions) > 0 else [],
+                        mask.shape, selected_blocks.shape,
+                    )
+
                 selected_blocks = selected_blocks.clone()  # Make copy
                 selected_blocks.masked_fill_(~mask, 0)
                 after_mask_sum = selected_blocks.sum().item()
+                after_nonzero = (selected_blocks != 0).sum().item()
 
                 # Check mask - count True values
                 num_masked_tokens = mask.sum().item()
-                num_nonzero = (selected_blocks != 0).sum().item()
                 logger.info(
                     "[MULTI_RP] 📊 RP_RANK=%d layer=%s: %d/%d tokens kept (%.1f%%), "
-                    "sum: %.2f → %.2f, nonzero_elements=%d",
+                    "sum: %.2f (nonzero=%d) → %.2f (nonzero=%d)",
                     rp_rank, layer_name, num_masked_tokens, num_blocks * self.block_size,
                     100.0 * num_masked_tokens / (num_blocks * self.block_size),
-                    before_mask_sum, after_mask_sum, num_nonzero,
+                    before_mask_sum, before_nonzero, after_mask_sum, after_nonzero,
                 )
 
                 # Accumulate into parent's accumulator
