@@ -69,7 +69,7 @@ try:
     from nixl._api import nixl_agent as NixlWrapper
     from nixl._bindings import nixlXferTelemetry
 
-    logger.info("NIXL is available")
+    logger.debug("NIXL is available")
 except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
@@ -204,7 +204,7 @@ class NixlConnector(KVConnectorBase_V1):
             # as the layout should not matter in that case,
             # which fallback to the default behavior.
             return None
-        logger.info_once(
+        logger.debug_once(
             "NixlConnector setting KV cache layout to HND for better xfer performance."
         )
         return "HND"
@@ -376,7 +376,7 @@ class NixlConnectorScheduler:
                 vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
             )
 
-        logger.info("Initializing NIXL Scheduler %s", engine_id)
+        logger.debug("Initializing NIXL Scheduler %s", engine_id)
 
         # Ring parallel configuration for KV transfer coordination
         self.rp_size = vllm_config.parallel_config.ring_parallel_size
@@ -484,7 +484,7 @@ class NixlConnectorScheduler:
                         break
                     continue
 
-                logger.info("[LISTENER] Received request from identity: %s", identity)
+                logger.debug("[LISTENER] Received request from identity: %s", identity)
 
                 # Decode message: supports both 2-tuple (legacy) and 3-tuple (multi-RP)
                 # (GET_META_MSG, tp_rank) or (GET_META_MSG, tp_rank, rp_rank)
@@ -505,7 +505,7 @@ class NixlConnectorScheduler:
                     logger.warning("[LISTENER] Invalid message format: %s", decoded)
                     continue
 
-                logger.info(
+                logger.debug(
                     "[LISTENER] Decoded request: type=%s, TP rank=%s, RP rank=%s",
                     msg_type,
                     target_tp_rank,
@@ -520,21 +520,21 @@ class NixlConnectorScheduler:
                 response_data = None
                 try:
                     response_data = encoded_data[target_tp_rank][target_rp_rank]
-                    logger.info(
+                    logger.debug(
                         "[LISTENER] Found metadata for TP rank %s, RP rank %s (%d bytes)",
                         target_tp_rank,
                         target_rp_rank,
                         len(response_data),
                     )
                 except KeyError:
-                    logger.info(
+                    logger.debug(
                         "[LISTENER] RP rank %s not found for TP rank %s, falling back to rp_rank=0",
                         target_rp_rank,
                         target_tp_rank,
                     )
                     try:
                         response_data = encoded_data[target_tp_rank][0]
-                        logger.info(
+                        logger.debug(
                             "[LISTENER] Using fallback metadata for TP rank %s (%d bytes)",
                             target_tp_rank,
                             len(response_data),
@@ -558,13 +558,13 @@ class NixlConnectorScheduler:
                     )
                     response_data = b""
 
-                logger.info(
+                logger.debug(
                     "[LISTENER] Sending response to identity %s: %d bytes",
                     identity,
                     len(response_data),
                 )
                 sock.send_multipart((identity, b"", response_data))
-                logger.info("[LISTENER] Response sent successfully")
+                logger.debug("[LISTENER] Response sent successfully")
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -585,7 +585,7 @@ class NixlConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.info(
+        logger.debug(
             "[GET_TOKENS] get_num_new_matched_tokens: request_id=%s, "
             "num_computed_tokens=%s, kv_transfer_params=%s",
             request.request_id,
@@ -597,7 +597,7 @@ class NixlConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
-            logger.info(
+            logger.debug(
                 "[GET_TOKENS] Remote prefill detected for request %s: will pull %d tokens",
                 request.request_id,
                 count,
@@ -606,14 +606,14 @@ class NixlConnectorScheduler:
                 return count, True
 
         # No remote prefill for this request.
-        logger.info("[GET_TOKENS] No remote prefill for request %s", request.request_id)
+        logger.debug("[GET_TOKENS] No remote prefill for request %s", request.request_id)
         return 0, False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         params = request.kv_transfer_params
-        logger.info(
+        logger.debug(
             "[UPDATE_STATE] update_state_after_alloc: request_id=%s, "
             "num_external_tokens=%s, kv_transfer_params=%s",
             request.request_id,
@@ -622,7 +622,7 @@ class NixlConnectorScheduler:
         )
 
         if not params:
-            logger.info("[UPDATE_STATE] No kv_transfer_params for request %s", request.request_id)
+            logger.debug("[UPDATE_STATE] No kv_transfer_params for request %s", request.request_id)
             return
 
         # For prefill (which is what we care about here for RP gather),
@@ -631,7 +631,7 @@ class NixlConnectorScheduler:
         seq_len = len(request.prompt_token_ids) if request.prompt_token_ids else 0
 
         if params.get("do_remote_decode"):
-            logger.info(
+            logger.debug(
                 "[UPDATE_STATE] Remote decode detected for request %s, adding to batch",
                 request.request_id,
             )
@@ -926,8 +926,8 @@ class NixlConnectorWorker:
         if NixlWrapper is None:
             logger.error("NIXL is not available")
             raise RuntimeError("NIXL is not available")
-        logger.info("Initializing NIXL wrapper")
-        logger.info("Initializing NIXL worker %s", engine_id)
+        logger.debug("Initializing NIXL wrapper")
+        logger.debug("Initializing NIXL worker %s", engine_id)
 
         # Config.
         self.vllm_config = vllm_config
@@ -1001,7 +1001,7 @@ class NixlConnectorWorker:
             # Force host buffer for multi-RP transfer to avoid GPU Direct RDMA
             # cache coherency issues with masking operations
             if envs.VLLM_ENABLE_MULTI_RP_TRANSFER and self.rp_size > 1:
-                logger.info(
+                logger.debug(
                     "[NIXL] Forcing use_host_buffer=True and kv_buffer_device='cpu' "
                     "for multi-RP transfer (rp_size=%d) to ensure masking coherency",
                     self.rp_size,
@@ -1150,7 +1150,7 @@ class NixlConnectorWorker:
 
         # Connect to all RP ranks for this TP rank
         for rp_rank in range(actual_remote_rp_size):
-            logger.info(
+            logger.debug(
                 "[HANDSHAKE] Starting query for path: %s, TP rank %s, RP rank %s (loop iteration %d/%d)",
                 path,
                 p_remote_tp_rank,
@@ -1167,12 +1167,12 @@ class NixlConnectorWorker:
                     sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                     sock.setsockopt(zmq.SNDTIMEO, 5000)  # Add send timeout too
 
-                    logger.info("[HANDSHAKE] Sending query message for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+                    logger.debug("[HANDSHAKE] Sending query message for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
                     sock.send(msg)
 
-                    logger.info("[HANDSHAKE] Waiting for response for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+                    logger.debug("[HANDSHAKE] Waiting for response for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
                     metadata_bytes = sock.recv()
-                    logger.info("[HANDSHAKE] Received response (%d bytes) for TP=%s, RP=%s",
+                    logger.debug("[HANDSHAKE] Received response (%d bytes) for TP=%s, RP=%s",
                                len(metadata_bytes) if metadata_bytes else 0, p_remote_tp_rank, rp_rank)
 
                     # Check for empty response (metadata not available)
@@ -1202,11 +1202,11 @@ class NixlConnectorWorker:
                 raise
 
             # Decode metadata (outside try-except block)
-            logger.info("[HANDSHAKE] Decoding metadata for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+            logger.debug("[HANDSHAKE] Decoding metadata for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
             decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
             metadata = decoder.decode(metadata_bytes)
             got_metadata_time = time.perf_counter()
-            logger.info(
+            logger.debug(
                 "[HANDSHAKE] Decoded metadata for TP=%s, RP=%s (took %.3fs)",
                 p_remote_tp_rank,
                 rp_rank,
@@ -1239,13 +1239,13 @@ class NixlConnectorWorker:
             else:
                 # Legacy mode: accept rp_rank=0 for all requests
                 if rp_rank > 0:
-                    logger.info(
+                    logger.debug(
                         "[HANDSHAKE] Legacy mode: Using rp_rank=0 metadata for rp_rank=%d request",
                         rp_rank,
                     )
 
             # Register Remote agent
-            logger.info("[HANDSHAKE] Registering remote agent for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
+            logger.debug("[HANDSHAKE] Registering remote agent for TP=%s, RP=%s", p_remote_tp_rank, rp_rank)
             assert metadata.block_size <= self.block_size, "nP > nD is not supported yet."
 
             remote_agent_name = self.add_remote_agent(
@@ -1255,7 +1255,7 @@ class NixlConnectorWorker:
             agents[p_remote_tp_rank][rp_rank] = remote_agent_name
 
             setup_agent_time = time.perf_counter()
-            logger.info(
+            logger.debug(
                 "[HANDSHAKE] Registered agent for TP=%s, RP=%s (took %.3fs)",
                 p_remote_tp_rank,
                 rp_rank,
@@ -1266,7 +1266,7 @@ class NixlConnectorWorker:
             if rp_rank == 0:
                 actual_remote_rp_size = metadata.rp_size
                 if actual_remote_rp_size != remote_rp_size:
-                    logger.info(
+                    logger.debug(
                         "[HANDSHAKE] Adjusting RP size: requested %d, actual %d",
                         remote_rp_size,
                         actual_remote_rp_size,
@@ -1274,7 +1274,7 @@ class NixlConnectorWorker:
 
                 # Legacy mode (rp_size=1): Fill all requested ranks with same agent
                 if actual_remote_rp_size <= 1:
-                    logger.info(
+                    logger.debug(
                         "[HANDSHAKE] Legacy mode detected (rp_size=%d). "
                         "Reusing rp_rank=0 agent for all requested RP ranks.",
                         actual_remote_rp_size,
@@ -1304,7 +1304,7 @@ class NixlConnectorWorker:
                     and self.vllm_config.kv_transfer_config is not None
                     and self.vllm_config.kv_transfer_config.enable_permute_local_kv
                 ):
-                    logger.info_once(
+                    logger.debug_once(
                         "'enable_permute_local_kv' flag is enabled while "
                         "device KV Layout is NHD. Init host buffer with"
                         " HND to better support Decode/Prefill TP_ratio > 1."
@@ -1405,7 +1405,7 @@ class NixlConnectorWorker:
                 f"kv_buffer_device is {self.kv_buffer_device}"
             )
 
-        logger.info(
+        logger.debug(
             "Registering KV_Caches. use_mla: %s, kv_buffer_device: %s, "
             "use_host_buffer: %s",
             self.use_mla,
@@ -1454,7 +1454,7 @@ class NixlConnectorWorker:
                 kernel_block_size = cache.shape[block_size_position]
 
                 if self.block_size != kernel_block_size:
-                    logger.info_once(
+                    logger.debug_once(
                         "User-specified logical block size (%s) does not match"
                         " physical kernel block size (%s). Using the latter. ",
                         self.block_size,
@@ -1814,7 +1814,7 @@ class NixlConnectorWorker:
                 self.kv_transfer_config.enable_permute_local_kv
                 and nixl_agent_meta.kv_cache_layout == "HND"
             ):
-                logger.info(
+                logger.debug(
                     "Remote is HND and local is NHD, enabled additional permute "
                     "on local device KV."
                 )
@@ -1916,7 +1916,7 @@ class NixlConnectorWorker:
                     else:
                         total_size_mb = 0
 
-                    logger.info(
+                    logger.debug(
                         "[PREFILL-SEND] 🔵 RP_RANK=%d sending PARTIAL KV: "
                         "req=%s, blocks=%d, seq_len=%d, size=%.2f MB",
                         self.rp_rank, req_id, num_blocks, seq_len, total_size_mb
@@ -1932,7 +1932,7 @@ class NixlConnectorWorker:
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
-                logger.info(
+                logger.debug(
                     "[SAVE_KV] 📦 RP_RANK=%d: Starting D2H copy for %d blocks: %s",
                     self.rp_rank, len(meta.local_physical_block_ids), meta.local_physical_block_ids,
                 )
@@ -1956,13 +1956,13 @@ class NixlConnectorWorker:
                         for pos in range(min(10, host_blocks.shape[1])):
                             if host_blocks[0, pos].abs().sum() > 0.01:
                                 nonzero_positions.append(pos)
-                        logger.info(
+                        logger.debug(
                             "[SAVE_KV] ✅ RP_RANK=%d: D2H copy complete. host_sum=%.2f, "
                             "nonzero_positions=%s",
                             self.rp_rank, host_sum, nonzero_positions,
                         )
                     else:
-                        logger.info(
+                        logger.debug(
                             "[SAVE_KV] ✅ RP_RANK=%d: D2H copy complete. host_sum=%.2f",
                             self.rp_rank, host_sum,
                         )
@@ -2246,7 +2246,7 @@ class NixlConnectorWorker:
         seq_len = parent_meta['seq_len']
         num_ranks = parent_meta['num_ranks']
 
-        logger.info(
+        logger.debug(
             "[DECODE-RECV] ✅ Completed from RP_RANK=%d: req=%s (%d/%d ranks done)",
             rp_rank, parent_request_id,
             len(parent_meta['completed_ranks']) + 1, num_ranks,
@@ -2264,7 +2264,7 @@ class NixlConnectorWorker:
         if parent_meta['pending_rp_ranks']:
             # SEQUENTIAL TRANSFER: Start next RP rank
             next_rp_rank = parent_meta['pending_rp_ranks'].pop(0)
-            logger.info(
+            logger.debug(
                 "[DECODE-RECV] 🔄 RP_RANK=%d done → Starting RP_RANK=%d (remaining=%d)",
                 rp_rank, next_rp_rank, len(parent_meta['pending_rp_ranks']),
             )
@@ -2279,7 +2279,7 @@ class NixlConnectorWorker:
             )
         elif len(parent_meta['completed_ranks']) == num_ranks:
             # All ranks completed
-            logger.info(
+            logger.debug(
                 "[DECODE-RECV] 🎉 ALL %d RP ranks completed for req=%s - Reassembly DONE",
                 num_ranks, parent_request_id,
             )
@@ -2365,7 +2365,7 @@ class NixlConnectorWorker:
                 self._reqs_to_send[req_id] = expiration_time
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
-        logger.info(
+        logger.debug(
             "[READ_BLOCKS] Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id,
             req_id,
@@ -2373,7 +2373,7 @@ class NixlConnectorWorker:
         # Use rp_size and rp_rank from handshake metadata, falling back to meta if not available
         remote_rp_size = self._rp_size.get(meta.remote_engine_id, meta.rp_size)
         remote_rp_rank = self._rp_rank.get(meta.remote_engine_id, meta.rp_rank)
-        logger.info(
+        logger.debug(
             "[READ_BLOCKS] Request %s: remote_rp_size=%d, remote_rp_rank=%d, seq_len=%d",
             req_id,
             remote_rp_size,
@@ -2400,7 +2400,7 @@ class NixlConnectorWorker:
         remote_rp_rank: int = 0,
         seq_len: int = 0,
     ):
-        logger.info(
+        logger.debug(
             "[READ_BLOCKS] _read_blocks called for request %s: "
             "remote_rp_size=%d, remote_rp_rank=%d, seq_len=%d, multi_rp_enabled=%s",
             request_id,
@@ -2418,7 +2418,7 @@ class NixlConnectorWorker:
         )
 
         if use_multi_rp:
-            logger.info(
+            logger.debug(
                 "[READ_BLOCKS] Using multi-RP transfer for request %s (rp_size=%d, seq_len=%d)",
                 request_id,
                 remote_rp_size,
@@ -2434,14 +2434,14 @@ class NixlConnectorWorker:
             )
 
         # Legacy mode: only allow rp_rank=0 to send KV blocks
-        logger.info(
+        logger.debug(
             "[READ_BLOCKS] Using legacy mode for request %s (rp_size=%d, rp_rank=%d)",
             request_id,
             remote_rp_size,
             remote_rp_rank,
         )
         if remote_rp_size > 1 and remote_rp_rank != 0:
-            logger.info(
+            logger.debug(
                 "[READ_BLOCKS] Skipping transfer: non-zero RP rank (%d) in legacy mode",
                 remote_rp_rank,
             )
@@ -2717,7 +2717,7 @@ class NixlConnectorWorker:
         else:
             total_size_mb = 0
 
-        logger.info(
+        logger.debug(
             "[DECODE-RECV] 🟢 Starting transfer from RP_RANK=%d: "
             "req=%s, local_blocks=%d, remote_blocks=%d, size=%.2f MB",
             rp_rank, parent_request_id, num_local_blocks, num_remote_blocks, total_size_mb
@@ -2928,7 +2928,7 @@ class NixlConnectorWorker:
         if tail_start >= seq_len:
             tail_start = tail_end = 0
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] 🎯 Masking RP_RANK=%d: seq_len=%d, block_ids=%s, "
             "head=[%d,%d), tail=[%d,%d), block_size=%d",
             rp_rank, seq_len, block_ids, head_start, head_end, tail_start, tail_end, self.block_size,
@@ -2960,7 +2960,7 @@ class NixlConnectorWorker:
                     m_start = head_overlap_start - block_start_token
                     m_end = head_overlap_end - block_start_token
                     mask[i, m_start:m_end] = True
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 🎯 Mask HEAD: block_id=%d, block_tokens=[%d,%d), "
                         "head_interval=[%d,%d) → mask[%d, %d:%d]=True",
                         block_id, block_start_token, block_end_token,
@@ -2974,7 +2974,7 @@ class NixlConnectorWorker:
                     m_start = tail_overlap_start - block_start_token
                     m_end = tail_overlap_end - block_start_token
                     mask[i, m_start:m_end] = True
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 🎯 Mask TAIL: block_id=%d, block_tokens=[%d,%d), "
                         "tail_interval=[%d,%d) → mask[%d, %d:%d]=True",
                         block_id, block_start_token, block_end_token,
@@ -2999,7 +2999,7 @@ class NixlConnectorWorker:
                 if layer_name == "model.layers.0.self_attn.attn":
                     mask_2d = mask.view(num_blocks, self.block_size)
                     true_positions = torch.where(mask_2d[0])[0] if num_blocks > 0 else torch.tensor([])
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 🎭 RP_RANK=%d mask before reshape: shape=%s, true_positions=%s",
                         rp_rank, mask.shape, true_positions.tolist()[:20],
                     )
@@ -3008,7 +3008,7 @@ class NixlConnectorWorker:
 
                 # Log mask after reshape
                 if layer_name == "model.layers.0.self_attn.attn":
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 🎭 RP_RANK=%d mask after reshape: shape=%s → %s, "
                         "block_dim_idx=%d, tensor_dims=%s",
                         rp_rank, (num_blocks, self.block_size), view_shape, block_dim_idx, dims,
@@ -3029,7 +3029,7 @@ class NixlConnectorWorker:
                     mask_2d = mask.view(num_blocks, self.block_size)
                     mask_true_positions = torch.where(mask_2d[0])[0]
 
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 🔍 RP_RANK=%d BEFORE mask: "
                         "nonzero_tokens=%s, mask_tokens=%s, match=%s",
                         rp_rank, nonzero_token_positions.tolist(),
@@ -3044,7 +3044,7 @@ class NixlConnectorWorker:
 
                 # Check mask - count True values
                 num_masked_tokens = mask.sum().item()
-                logger.info(
+                logger.debug(
                     "[MULTI_RP] 📊 RP_RANK=%d layer=%s: %d/%d tokens kept (%.1f%%), "
                     "sum: %.2f (nonzero=%d) → %.2f (nonzero=%d)",
                     rp_rank, layer_name, num_masked_tokens, num_blocks * self.block_size,
@@ -3057,7 +3057,7 @@ class NixlConnectorWorker:
                     # First rank: initialize accumulator
                     parent_meta['accumulator'] = {layer_name: selected_blocks.clone()}
                     init_sum = selected_blocks.sum().item()
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] ✅ Initialized accumulator with RP_RANK=%d (layer=%s, shape=%s, sum=%.2f)",
                         rp_rank, layer_name, selected_blocks.shape, init_sum,
                     )
@@ -3070,7 +3070,7 @@ class NixlConnectorWorker:
                         to_add_sum = selected_blocks.sum().item()
                         parent_meta['accumulator'][layer_name] += selected_blocks
                         after_accum = parent_meta['accumulator'][layer_name].sum().item()
-                        logger.info(
+                        logger.debug(
                             "[MULTI_RP] ➕ Added RP_RANK=%d to accumulator (layer=%s): "
                             "before=%.2f + adding=%.2f → after=%.2f",
                             rp_rank, layer_name, before_accum, to_add_sum, after_accum,
@@ -3085,7 +3085,7 @@ class NixlConnectorWorker:
             logger.error("[MULTI_RP] ❌ No accumulator found for finalization")
             return
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] 💾 Finalizing: Writing %d layers to block_ids=%s",
             len(accumulator), block_ids,
         )
@@ -3104,7 +3104,7 @@ class NixlConnectorWorker:
 
                 # Log detailed info for first 2 layers
                 if written_count < 2:
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 💾 BEFORE write layer %s: "
                         "cache_sum=%.2f, accum_sum=%.2f, same_data=%s, "
                         "cache_shape=%s, accum_shape=%s, "
@@ -3123,7 +3123,7 @@ class NixlConnectorWorker:
 
                 written_count += 1
                 if written_count <= 2:  # Only log first 2 layers
-                    logger.info(
+                    logger.debug(
                         "[MULTI_RP] 💾 AFTER write layer %s: "
                         "after_sum=%.2f, expected=%.2f, write_success=%s",
                         layer_name, after_sum, accum_sum, write_success,
@@ -3134,7 +3134,7 @@ class NixlConnectorWorker:
                     layer_name,
                 )
 
-        logger.info(
+        logger.debug(
             "[MULTI_RP] 💾 Finalization complete: Wrote %d/%d layers",
             written_count, len(accumulator),
         )
@@ -3148,7 +3148,7 @@ class NixlConnectorWorker:
         - But decode side expects data at GLOBAL positions
         - This function copies data from local→global positions and zeros out non-owned positions
         """
-        logger.info(
+        logger.debug(
             "[PREFILL-RELOCATE] 🚀 ENTRY: rp_rank=%d, seq_len=%d, rp_size=%d, num_blocks=%d",
             rp_rank, seq_len, self.rp_size, len(block_ids),
         )
@@ -3184,7 +3184,7 @@ class NixlConnectorWorker:
 
         num_owned = len(owned_global_positions)
 
-        logger.info(
+        logger.debug(
             "[PREFILL-RELOCATE] 🎭 RP_RANK=%d: seq_len=%d, blocks=%d, "
             "head=[%d,%d), tail=[%d,%d), owned=%d tokens at positions %s",
             rp_rank, seq_len, len(block_ids), head_start, head_end, tail_start, tail_end,
@@ -3223,7 +3223,7 @@ class NixlConnectorWorker:
                 for pos_idx in range(min(10, selected_blocks.shape[block_dim_idx])):
                     if selected_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
                         original_nonzero.append(pos_idx)
-                logger.info(
+                logger.debug(
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s BEFORE: nonzero_positions=%s (should be local [0,1,...])",
                     rp_rank, layer_name, original_nonzero[:10],
                 )
@@ -3252,7 +3252,7 @@ class NixlConnectorWorker:
                     # Log first copy for debugging
                     if global_pos == owned_global_positions[0]:
                         src_data = selected_blocks[global_block_idx, global_pos_in_block]
-                        logger.info(
+                        logger.debug(
                             "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s COPY: "
                             "src[%d,%d] (sum=%.2f) → dst[%d,%d], shape=%s",
                             rp_rank, layer_name,
@@ -3274,7 +3274,7 @@ class NixlConnectorWorker:
                 for pos_idx in range(min(10, relocated_blocks.shape[block_dim_idx])):
                     if relocated_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
                         relocated_nonzero.append(pos_idx)
-                logger.info(
+                logger.debug(
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s AFTER: nonzero_positions=%s (should be global %s)",
                     rp_rank, layer_name, relocated_nonzero[:10], owned_global_positions[:10],
                 )
@@ -3284,7 +3284,7 @@ class NixlConnectorWorker:
                 for pos_idx in range(min(10, relocated_blocks.shape[block_dim_idx])):
                     if relocated_blocks[0, pos_idx].abs().sum() > 0.01:
                         relocated_nonzero.append(pos_idx)
-                logger.info(
+                logger.debug(
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s AFTER (MLA): nonzero_positions=%s (should be global %s)",
                     rp_rank, layer_name, relocated_nonzero[:10], owned_global_positions[:10],
                 )
@@ -3299,7 +3299,7 @@ class NixlConnectorWorker:
                 for pos_idx in range(min(10, verify_blocks.shape[block_dim_idx])):
                     if verify_blocks[0, :, pos_idx, :].abs().sum() > 0.01:
                         verify_nonzero.append(pos_idx)
-                logger.info(
+                logger.debug(
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s VERIFY: nonzero_positions=%s (read back from cache)",
                     rp_rank, layer_name, verify_nonzero[:10],
                 )
@@ -3310,12 +3310,12 @@ class NixlConnectorWorker:
                 for pos_idx in range(min(10, verify_blocks.shape[block_dim_idx])):
                     if verify_blocks[0, pos_idx].abs().sum() > 0.01:
                         verify_nonzero.append(pos_idx)
-                logger.info(
+                logger.debug(
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s VERIFY (MLA): nonzero_positions=%s (read back from cache)",
                     rp_rank, layer_name, verify_nonzero[:10],
                 )
 
-            logger.info(
+            logger.debug(
                 "[PREFILL-RELOCATE] ✅ RP_RANK=%d layer=%s: relocated %d tokens from local→global positions",
                 rp_rank, layer_name, num_owned,
             )
@@ -3323,7 +3323,7 @@ class NixlConnectorWorker:
         # CRITICAL: Synchronize to ensure relocation is complete before copy_blocks
         # Without this, the d2h copy may read unmodified data (relocation not yet visible)
         torch.cuda.synchronize()
-        logger.info(
+        logger.debug(
             "[PREFILL-RELOCATE] 🔄 RP_RANK=%d: CUDA synchronize complete after relocation",
             rp_rank,
         )
