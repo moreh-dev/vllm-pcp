@@ -998,6 +998,18 @@ class NixlConnectorWorker:
             self.use_host_buffer = False
         else:
             self.use_host_buffer = self.kv_buffer_device == "cpu"
+            # Force host buffer for multi-RP transfer to avoid GPU Direct RDMA
+            # cache coherency issues with masking operations
+            if envs.VLLM_ENABLE_MULTI_RP_TRANSFER and self.rp_size > 1:
+                logger.info(
+                    "[NIXL] Forcing use_host_buffer=True and kv_buffer_device='cpu' "
+                    "for multi-RP transfer (rp_size=%d) to ensure masking coherency",
+                    self.rp_size,
+                )
+                self.use_host_buffer = True
+                # Also set kv_buffer_device to 'cpu' so that copy_blocks gets set
+                # in set_host_xfer_buffer_ops, enabling the d2h copy path
+                self.kv_buffer_device = "cpu"
 
         # support for oot platform which can't register nixl memory
         # type based on kv_buffer_device
@@ -1920,6 +1932,10 @@ class NixlConnectorWorker:
 
             # 2. Copy to Host Buffer (if needed)
             if do_host_copy:
+                logger.info(
+                    "[SAVE_KV] 📦 RP_RANK=%d: Starting D2H copy for %d blocks: %s",
+                    self.rp_rank, len(meta.local_physical_block_ids), meta.local_physical_block_ids,
+                )
                 # blocking
                 self.copy_blocks(
                     self.device_kv_caches,
@@ -1927,6 +1943,35 @@ class NixlConnectorWorker:
                     meta.local_physical_block_ids,
                     meta.local_physical_block_ids,
                     "d2h",
+                )
+                # Verify host buffer has data
+                if self.host_xfer_buffers:
+                    first_layer = list(self.host_xfer_buffers.keys())[0]
+                    host_cache = self.host_xfer_buffers[first_layer]
+                    host_blocks = host_cache[meta.local_physical_block_ids]
+                    host_sum = host_blocks.sum().item()
+                    # Check nonzero positions for MLA layout [blocks, block_size, kv_dim]
+                    if len(host_blocks.shape) == 3 and host_blocks.shape[1] == self.block_size:
+                        nonzero_positions = []
+                        for pos in range(min(10, host_blocks.shape[1])):
+                            if host_blocks[0, pos].abs().sum() > 0.01:
+                                nonzero_positions.append(pos)
+                        logger.info(
+                            "[SAVE_KV] ✅ RP_RANK=%d: D2H copy complete. host_sum=%.2f, "
+                            "nonzero_positions=%s",
+                            self.rp_rank, host_sum, nonzero_positions,
+                        )
+                    else:
+                        logger.info(
+                            "[SAVE_KV] ✅ RP_RANK=%d: D2H copy complete. host_sum=%.2f",
+                            self.rp_rank, host_sum,
+                        )
+            else:
+                logger.warning(
+                    "[SAVE_KV] ⚠️ RP_RANK=%d: SKIPPING D2H copy! "
+                    "do_host_copy=%s, use_host_buffer=%s, copy_blocks=%s",
+                    self.rp_rank, do_host_copy, self.use_host_buffer,
+                    self.copy_blocks is not None,
                 )
 
     def permute_device_kv(self, block_ids: list[int]):
@@ -3183,31 +3228,39 @@ class NixlConnectorWorker:
                     rp_rank, layer_name, original_nonzero[:10],
                 )
 
-            # Copy data from LOCAL positions to GLOBAL positions
-            for local_idx, global_pos in enumerate(owned_global_positions):
+            # MASKING: Keep data at owned global positions, zero out the rest
+            # Ring Attention stores KV at GLOBAL positions already, so we just need to mask
+            for global_pos in owned_global_positions:
                 if global_pos >= seq_len:
                     break
 
-                # Calculate block and position indices
-                local_block_idx = local_idx // self.block_size
-                local_pos_in_block = local_idx % self.block_size
-
+                # Calculate block and position indices (same for src and dst - global position)
                 global_block_idx = global_pos // self.block_size
                 global_pos_in_block = global_pos % self.block_size
 
-                if local_block_idx >= len(block_ids) or global_block_idx >= len(block_ids):
+                if global_block_idx >= len(block_ids):
                     continue
 
-                # Copy data: local → global
+                # Copy data from global position to global position (masking operation)
                 # Handle different tensor layouts
                 if block_dim_idx == 2:
                     # Common layout: [num_blocks, num_heads, block_size, head_size]
                     relocated_blocks[global_block_idx, :, global_pos_in_block, :] = \
-                        selected_blocks[local_block_idx, :, local_pos_in_block, :]
+                        selected_blocks[global_block_idx, :, global_pos_in_block, :]
                 elif block_dim_idx == 1:
                     # Layout: [num_blocks, block_size, ...]
+                    # Log first copy for debugging
+                    if global_pos == owned_global_positions[0]:
+                        src_data = selected_blocks[global_block_idx, global_pos_in_block]
+                        logger.info(
+                            "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s COPY: "
+                            "src[%d,%d] (sum=%.2f) → dst[%d,%d], shape=%s",
+                            rp_rank, layer_name,
+                            global_block_idx, global_pos_in_block, src_data.sum().item(),
+                            global_block_idx, global_pos_in_block, dims,
+                        )
                     relocated_blocks[global_block_idx, global_pos_in_block] = \
-                        selected_blocks[local_block_idx, local_pos_in_block]
+                        selected_blocks[global_block_idx, global_pos_in_block]
                 else:
                     logger.warning(
                         "[PREFILL-RELOCATE] ⚠️ Unexpected block_dim_idx=%d in shape %s",
@@ -3225,6 +3278,16 @@ class NixlConnectorWorker:
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s AFTER: nonzero_positions=%s (should be global %s)",
                     rp_rank, layer_name, relocated_nonzero[:10], owned_global_positions[:10],
                 )
+            elif block_dim_idx == 1:
+                # MLA layout: [num_blocks, block_size, kv_dim]
+                relocated_nonzero = []
+                for pos_idx in range(min(10, relocated_blocks.shape[block_dim_idx])):
+                    if relocated_blocks[0, pos_idx].abs().sum() > 0.01:
+                        relocated_nonzero.append(pos_idx)
+                logger.info(
+                    "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s AFTER (MLA): nonzero_positions=%s (should be global %s)",
+                    rp_rank, layer_name, relocated_nonzero[:10], owned_global_positions[:10],
+                )
 
             # Write back to cache
             cache[block_ids] = relocated_blocks
@@ -3240,11 +3303,30 @@ class NixlConnectorWorker:
                     "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s VERIFY: nonzero_positions=%s (read back from cache)",
                     rp_rank, layer_name, verify_nonzero[:10],
                 )
+            elif block_dim_idx == 1:
+                # MLA layout verification
+                verify_blocks = cache[block_ids]
+                verify_nonzero = []
+                for pos_idx in range(min(10, verify_blocks.shape[block_dim_idx])):
+                    if verify_blocks[0, pos_idx].abs().sum() > 0.01:
+                        verify_nonzero.append(pos_idx)
+                logger.info(
+                    "[PREFILL-RELOCATE] 🔍 RP_RANK=%d layer=%s VERIFY (MLA): nonzero_positions=%s (read back from cache)",
+                    rp_rank, layer_name, verify_nonzero[:10],
+                )
 
             logger.info(
                 "[PREFILL-RELOCATE] ✅ RP_RANK=%d layer=%s: relocated %d tokens from local→global positions",
                 rp_rank, layer_name, num_owned,
             )
+
+        # CRITICAL: Synchronize to ensure relocation is complete before copy_blocks
+        # Without this, the d2h copy may read unmodified data (relocation not yet visible)
+        torch.cuda.synchronize()
+        logger.info(
+            "[PREFILL-RELOCATE] 🔄 RP_RANK=%d: CUDA synchronize complete after relocation",
+            rp_rank,
+        )
 
     def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
         """
