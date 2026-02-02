@@ -140,6 +140,13 @@ COPY --from=export_vllm /benchmarks ${COMMON_WORKDIR}/vllm/benchmarks
 COPY --from=export_vllm /examples ${COMMON_WORKDIR}/vllm/examples
 COPY --from=export_vllm /docker ${COMMON_WORKDIR}/vllm/docker
 
+RUN git clone https://github.com/feifeibear/long-context-attention.git \
+    && cd long-context-attention \
+    && MAX_JOBS=$(nproc) pip install . \
+    && pip install peft==0.17.0 \
+    && pip install xfuser \
+    && pip install quart hypercorn blinker --ignore-installed
+
 ENV TOKENIZERS_PARALLELISM=false
 
 # ENV that can improve safe tensor loading, and end-to-end time
