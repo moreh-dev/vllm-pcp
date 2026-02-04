@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_rp_group,
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
@@ -107,10 +108,13 @@ class NixlAgentMetadata(KVConnectorHandshakeMetadata):
     attn_backend_name: str
     kv_cache_layout: str
     block_size: int
+    rp_size: int = 1  # Ring parallel size for KV transfer coordination
+    rp_rank: int = 0  # Ring parallel rank of this worker
 
 
 @dataclass
 class ReqMeta:
+    seq_len: int  # NEW: Sequence length for calculating RP offsets
     local_block_ids: list[int]
     # To be used when logical block size does not match the kernel block size
     local_physical_block_ids: list[int]
@@ -119,6 +123,8 @@ class ReqMeta:
     remote_port: int
     remote_engine_id: str
     tp_size: int
+    rp_size: int = 1  # Ring parallel size of remote prefill
+    rp_rank: int = 0  # Ring parallel rank of remote prefill (decode talks to rp_rank=0)
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -132,6 +138,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
     def add_new_req(
         self,
         request_id: ReqId,
+        seq_len: int,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
@@ -140,6 +147,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # save and load are mutually exclusive
         assert load_remote_cache ^ save_to_host
         _req = ReqMeta(
+            seq_len=seq_len,
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
             remote_block_ids=kv_transfer_params["remote_block_ids"],
@@ -148,6 +156,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             remote_port=kv_transfer_params["remote_port"],
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            rp_size=kv_transfer_params.get("rp_size", 1),
+            rp_rank=kv_transfer_params.get("rp_rank", 0),
         )
         if save_to_host:
             self.reqs_to_save[request_id] = _req
@@ -316,7 +326,10 @@ class NixlConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
-        if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
+        
+        should_run_save = (self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks) or (self.connector_worker.rp_size > 1)
+
+        if should_run_save:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
 
     def shutdown(self):
@@ -336,6 +349,10 @@ class NixlConnector(KVConnectorBase_V1):
             None if no handshake metadata is available.
         """
         assert self.connector_worker is not None
+        # When ring parallel is used, only RP rank 0 should serve handshake metadata
+        # because it will have the complete KV cache after allgather
+        if self.connector_worker.rp_size > 1 and self.connector_worker.rp_rank != 0:
+            return None
         return self.connector_worker.xfer_handshake_metadata
 
 
@@ -361,6 +378,9 @@ class NixlConnectorScheduler:
 
         logger.info("Initializing NIXL Scheduler %s", engine_id)
 
+        # Ring parallel configuration for KV transfer coordination
+        self.rp_size = vllm_config.parallel_config.ring_parallel_size
+
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._encoded_xfer_handshake_metadata: dict[int, Any] = {}
@@ -369,8 +389,9 @@ class NixlConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        # tuple[Request, list[int]] -> tuple[Request, list[int], int] (req, blocks, seq_len)
+        self._reqs_need_recv: dict[ReqId, tuple[Request, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Request, list[int], int]] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
         self._reqs_in_batch: set[ReqId] = set()
@@ -511,12 +532,18 @@ class NixlConnectorScheduler:
         if not params:
             return
 
+        # For prefill (which is what we care about here for RP gather), 
+        # the sequence length is the number of prompt tokens.
+        # num_external_tokens is 0 for local prefill.
+        seq_len = len(request.prompt_token_ids) if request.prompt_token_ids else 0
+
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-        if self.use_host_buffer and params.get("do_remote_decode"):
-            # NOTE: when accelerator is not directly supported by Nixl,
-            # prefilled blocks need to be saved to host memory before transfer.
-
+        
+        # NOTE: when accelerator is not directly supported by Nixl,
+        # prefilled blocks need to be saved to host memory before transfer.
+        # Also need to trigger save for Ring Parallel to perform allgather.
+        if (self.use_host_buffer or self.rp_size > 1) and params.get("do_remote_decode"):
             # save all blocks
             block_ids = blocks.get_block_ids()[0]
             # TODO: skip the blocks that are already in the host xfer buffer.
@@ -525,7 +552,7 @@ class NixlConnectorScheduler:
             # block is not overwritten; and it will be safe to skip saving them
             # to host xfer buffer.
             if block_ids:
-                self._reqs_need_save[request.request_id] = (request, block_ids)
+                self._reqs_need_save[request.request_id] = (request, block_ids, seq_len)
         elif params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(
@@ -544,6 +571,7 @@ class NixlConnectorScheduler:
                     self._reqs_need_recv[request.request_id] = (
                         request,
                         local_block_ids,
+                        seq_len,
                     )
 
                 else:
@@ -564,20 +592,22 @@ class NixlConnectorScheduler:
         meta = NixlConnectorMetadata()
 
         # Loop through scheduled reqs and convert to ReqMeta.
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, seq_len) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req(
                 request_id=req_id,
+                seq_len=seq_len,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
                 load_remote_cache=True,
                 save_to_host=False,
             )
 
-        for req_id, (req, block_ids) in self._reqs_need_save.items():
+        for req_id, (req, block_ids, seq_len) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req(
                 request_id=req_id,
+                seq_len=seq_len,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
                 load_remote_cache=False,
@@ -626,7 +656,8 @@ class NixlConnectorScheduler:
             # To avoid stranding the prefill blocks in the prefill instance,
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [])
+            # Use seq_len=0 for abort case
+            self._reqs_need_recv[request.request_id] = (request, [], 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -662,6 +693,8 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            rp_size=self.rp_size,
+            rp_rank=0,  # Decode should only talk to rp_rank=0 on prefill
         )
 
 
@@ -839,6 +872,8 @@ class NixlConnectorWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
+        self.rp_size = vllm_config.parallel_config.ring_parallel_size
+        self.rp_rank = 0 if self.rp_size <= 1 else get_rp_group().rank_in_group
         self.num_blocks = 0
         self.enable_permute_local_kv = False
 
@@ -953,6 +988,8 @@ class NixlConnectorWorker:
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.world_size}
         self._block_size: dict[EngineId, int] = {self.engine_id: self.block_size}
+        self._rp_size: dict[EngineId, int] = {self.engine_id: self.rp_size}
+        self._rp_rank: dict[EngineId, int] = {self.engine_id: self.rp_rank}
         # With heterogeneous TP, P must wait for all assigned D TP workers to
         # finish reading before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
@@ -1188,6 +1225,8 @@ class NixlConnectorWorker:
                 base_addr = cache.data_ptr()
                 if not self.use_host_buffer and current_platform.is_cuda_alike():
                     self.device_id = cache.device.index
+                # Zero out the cache to ensure clean state for Ring Parallel all-reduce
+                cache.zero_()
                 if base_addr in seen_base_addresses:
                     continue
 
@@ -1309,6 +1348,8 @@ class NixlConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
+            rp_size=self.rp_size,
+            rp_rank=self.rp_rank,
         )
 
     def register_local_xfer_handler(
@@ -1424,6 +1465,10 @@ class NixlConnectorWorker:
             self._tp_size[engine_id] = remote_tp_size
         if engine_id not in self._block_size:
             self._block_size[engine_id] = nixl_agent_meta.block_size
+        if engine_id not in self._rp_size:
+            self._rp_size[engine_id] = nixl_agent_meta.rp_size
+        if engine_id not in self._rp_rank:
+            self._rp_rank[engine_id] = nixl_agent_meta.rp_rank
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1608,29 +1653,31 @@ class NixlConnectorWorker:
             )
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
-        """copy kv from device to host buffer."""
-        assert self.use_host_buffer
-        assert self.copy_blocks is not None
-
+        """copy kv from device to host buffer or gather kv from remote ranks."""
+        
+        # Determine if we need to copy to host
+        do_host_copy = self.use_host_buffer and self.copy_blocks is not None
+        
         for req_id, meta in metadata.reqs_to_save.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
             )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "save_load_kv for request[%s] to host xfer buffer."
-                    "local_block_ids: %s. ",
-                    req_id,
-                    ",".join(map(str, meta.local_physical_block_ids)),
+
+            # 1. Gather KV from Ring Parallel ranks to Rank 0 (if needed)
+            if self.rp_size > 1:
+                # We need to gather even if not copying to host
+                self._allgather_rp_kv(meta.local_physical_block_ids, getattr(meta, "seq_len", 0))
+
+            # 2. Copy to Host Buffer (if needed)
+            if do_host_copy:
+                # blocking
+                self.copy_blocks(
+                    self.device_kv_caches,
+                    self.host_xfer_buffers,
+                    meta.local_physical_block_ids,
+                    meta.local_physical_block_ids,
+                    "d2h",
                 )
-            # blocking
-            self.copy_blocks(
-                self.device_kv_caches,
-                self.host_xfer_buffers,
-                meta.local_physical_block_ids,
-                meta.local_physical_block_ids,
-                "d2h",
-            )
 
     def permute_device_kv(self, block_ids: list[int]):
         """Transforms the layout of received KV cache blocks to the local format.
@@ -1943,11 +1990,16 @@ class NixlConnectorWorker:
             meta.remote_engine_id,
             req_id,
         )
+        # Use rp_size and rp_rank from handshake metadata, falling back to meta if not available
+        remote_rp_size = self._rp_size.get(meta.remote_engine_id, meta.rp_size)
+        remote_rp_rank = self._rp_rank.get(meta.remote_engine_id, meta.rp_rank)
         self._read_blocks(
             request_id=req_id,
             dst_engine_id=meta.remote_engine_id,
             local_block_ids=meta.local_physical_block_ids,
             remote_block_ids=meta.remote_block_ids,
+            remote_rp_size=remote_rp_size,
+            remote_rp_rank=remote_rp_rank,
         )
 
     def _read_blocks(
@@ -1956,7 +2008,12 @@ class NixlConnectorWorker:
         remote_block_ids: list[int],
         dst_engine_id: str,
         request_id: str,
+        remote_rp_size: int = 1,
+        remote_rp_rank: int = 0,
     ):
+        # Only allow rp_rank=0 to send KV blocks when using ring parallel
+        if remote_rp_size > 1 and remote_rp_rank != 0:
+            return
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
         if block_size_ratio > 1:
             local_block_ids = self.get_mapped_blocks(
@@ -2219,6 +2276,108 @@ class NixlConnectorWorker:
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result
+
+    def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
+        """
+        Gather KV cache from all RP ranks to rp_rank=0.
+        The KV cache is sharded along seq_len dimension in zigzag pattern.
+        """
+        if self.rp_size <= 1:
+            return
+
+        if seq_len == 0:
+            return
+
+        # Prepare gathering
+        rp_group = get_rp_group()
+        rank = rp_group.rank_in_group
+        
+        rp_align = 2 * self.rp_size
+        ring_chunk_len = (seq_len + rp_align - 1) // rp_align
+        
+        # Owned intervals: [head_start, head_end) and [tail_start, tail_end)
+        head_start = ring_chunk_len * rank
+        head_end = min(head_start + ring_chunk_len, seq_len)
+        
+        tail_start = ring_chunk_len * (2 * self.rp_size - 1 - rank)
+        tail_end = min(tail_start + ring_chunk_len, seq_len)
+        
+        if head_start >= seq_len:
+            head_start = head_end = 0
+        if tail_start >= seq_len:
+            tail_start = tail_end = 0
+            
+        owned_intervals = []
+        if head_end > head_start:
+            owned_intervals.append((head_start, head_end))
+        if tail_end > tail_start:
+            owned_intervals.append((tail_start, tail_end))
+
+        # Iterate over all layers
+        for cache in self.device_kv_caches.values():
+            if len(block_ids) == 0:
+                continue
+
+            # Select blocks [num_blocks_to_xfer, ...]
+            # Advanced indexing creates a COPY.
+            selected_blocks = cache[block_ids]
+            
+            # Construct a mask tensor on the same device
+            num_blocks = len(block_ids)
+            mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool)
+            
+            for i in range(num_blocks):
+                block_start_token = i * self.block_size
+                block_end_token = block_start_token + self.block_size
+                
+                # Check intersection with owned intervals
+                # Check against head
+                head_overlap_start = max(block_start_token, head_start)
+                head_overlap_end = min(block_end_token, head_end)
+                
+                if head_overlap_end > head_overlap_start:
+                    m_start = head_overlap_start - block_start_token
+                    m_end = head_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+                    
+                # Check against tail
+                tail_overlap_start = max(block_start_token, tail_start)
+                tail_overlap_end = min(block_end_token, tail_end)
+                
+                if tail_overlap_end > tail_overlap_start:
+                    m_start = tail_overlap_start - block_start_token
+                    m_end = tail_overlap_end - block_start_token
+                    mask[i, m_start:m_end] = True
+            
+            mask = mask.to(selected_blocks.device)
+            
+            dims = selected_blocks.shape
+            block_dim_idx = -1
+            for idx, dim in enumerate(dims):
+                if dim == self.block_size:
+                    block_dim_idx = idx
+                    break
+            
+            if block_dim_idx != -1:
+                # Reshape mask
+                view_shape = [1] * len(dims)
+                view_shape[0] = num_blocks
+                view_shape[block_dim_idx] = self.block_size
+                mask = mask.view(view_shape)
+
+                # Apply mask: Zero out where mask is False (not owned)
+                selected_blocks.masked_fill_(~mask, 0)
+
+                # All-reduce (SUM) across RP group
+                torch.distributed.all_reduce(
+                    selected_blocks,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=rp_group.device_group
+                )
+
+                # Copy back result to rank 0
+                if rank == 0:
+                    cache[block_ids] = selected_blocks
 
     def __del__(self):
         self.shutdown()
