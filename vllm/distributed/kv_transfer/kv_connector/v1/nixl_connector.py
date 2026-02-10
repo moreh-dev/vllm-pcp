@@ -1463,7 +1463,7 @@ class NixlConnectorWorker:
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id] = nixl_agent_meta.kv_caches_base_addr
 
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size, rp_rank=rp_rank)
 
         # Number of D TP workers reading from a single P TP worker.
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(engine_id)
@@ -1518,7 +1518,8 @@ class NixlConnectorWorker:
         return remote_agent_name
 
     def _validate_remote_agent_handshake(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int,
+        rp_rank: int = 0,
     ):
         """
         Validate the remote agent handshake metadata ensuring the
@@ -1585,7 +1586,7 @@ class NixlConnectorWorker:
             )
 
         # TP workers have same #blocks.
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        assert self.dst_num_blocks[(remote_engine_id, rp_rank)] == nixl_agent_meta.num_blocks
 
         assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
 
@@ -2001,28 +2002,45 @@ class NixlConnectorWorker:
             return
 
         # P2P multi-RP case: split blocks by RP rank using zigzag mapping.
+        num_local = len(meta.local_physical_block_ids)
+        num_remote = len(meta.remote_block_ids)
+
+        # Full prefix cache hit: notify all RP ranks via _read_blocks.
+        if num_local == 0:
+            self._read_blocks(
+                request_id=req_id,
+                dst_engine_id=engine_id,
+                local_block_ids=[],
+                remote_block_ids=meta.remote_block_ids,
+                rp_rank=0,
+            )
+            return
+
         rp_block_mapping = self.compute_rp_block_mapping(
             meta.seq_len, remote_rp_size, self.block_size,
         )
 
-        all_remote = np.array(meta.remote_block_ids)
-        all_local = np.array(meta.local_physical_block_ids)
+        # Partial prefix cache hit: only last num_local blocks need transfer.
+        # start_idx is the first full-sequence block index that needs transfer.
+        start_idx = num_remote - num_local
+        transfer_indices = set(range(start_idx, num_remote))
 
         logger.debug(
             "P2P multi-RP read for req %s: distributing %d blocks "
-            "across %d RP ranks",
-            req_id, len(all_remote), remote_rp_size,
+            "(of %d total) across %d RP ranks",
+            req_id, num_local, num_remote, remote_rp_size,
         )
 
         for rp_rank, block_indices in rp_block_mapping.items():
-            indices = np.array(block_indices)
-            # Clip to actual block count
-            indices = indices[indices < len(all_remote)]
-            if len(indices) == 0:
+            # Filter to blocks that actually need transfer.
+            relevant = [idx for idx in block_indices
+                        if idx in transfer_indices and idx < num_remote]
+            if not relevant:
                 continue
 
-            rp_remote_blocks = all_remote[indices].tolist()
-            rp_local_blocks = all_local[indices].tolist()
+            rp_remote_blocks = [meta.remote_block_ids[idx] for idx in relevant]
+            rp_local_blocks = [meta.local_physical_block_ids[idx - start_idx]
+                               for idx in relevant]
 
             logger.debug(
                 "  rp_rank=%d: reading %d blocks",
