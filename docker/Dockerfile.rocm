@@ -149,51 +149,130 @@ RUN git clone https://github.com/feifeibear/long-context-attention.git \
     && ldconfig
 
 ARG UCX_VERSION=1.19.0
+ARG LMCACHE_VERSION=v0.3.11
+ARG MOONCAKE_VERSION=v0.3.8.post1
 
-RUN wget https://github.com/openucx/ucx/releases/download/v1.19.0/ucx-1.19.0.tar.gz \
-    && tar xzf ucx-1.19.0.tar.gz \
-    && cd ucx-1.19.0 \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \
+    apt-get update -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    wget \
+    perl \
+    pkg-config
+
+RUN --mount=type=cache,target=/var/cache/mlnx-ofed \
+    if [ ! -e /var/cache/mlnx-ofed/MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz ]; then \
+    cd /var/cache/mlnx-ofed \
+    && wget -q https://content.mellanox.com/ofed/MLNX_OFED-24.10-3.2.5.0/MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz; \
+    fi \
+    && mkdir -p /usr/local/src/mlnx-ofed \
+    && cd /usr/local/src/mlnx-ofed \
+    && tar --strip-components=2 -xzf /var/cache/mlnx-ofed/MLNX_OFED_LINUX-24.10-3.2.5.0-ubuntu22.04-x86_64.tgz   \
+    && ./mlnxofedinstall \
+    --force \
+    --without-fw-update \
+    --user-space-only \
+    --basic \
+    --with-perftest \
+    && rm -rf /usr/local/src/mlnx-ofed
+
+# Reinstall OpenMPI after MLNX OFED (MLNX OFED removes OpenMPI libraries)
+RUN apt-get update -y && apt-get install -y --reinstall libopenmpi-dev openmpi-bin && ldconfig
+
+RUN --mount=type=cache,target=/var/cache/ucx \
+    if [ ! -e /var/cache/ucx/ucx-${UCX_VERSION}.tar.gz ]; then \
+    cd /var/cache/ucx \
+    && wget -q "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz"; \
+    fi \
+    && mkdir -p /usr/local/src/ucx \
+    && cd /usr/local/src/ucx \
+    && tar --strip-components=1 -xzf /var/cache/ucx/ucx-${UCX_VERSION}.tar.gz \
     && ./configure \
-        --enable-shared \
-        --disable-static \
-        --disable-doxygen-doc \
-        --enable-optimizations \
-        --enable-devel-headers \
-        --with-rocm=/opt/rocm \
-        --with-verbs \
-        --with-dm \
-        --enable-mt \
-        --with-rc \
-        --with-rdmacm \
-        --with-mlx5 \
+    --prefix=/usr \
+    --enable-shared \
+    --disable-static \
+    --disable-doxygen-doc \
+    --enable-optimizations \
+    --enable-devel-headers \
+    --with-rocm=/opt/rocm \
+    --with-verbs \
+    --with-dm \
+    --enable-mt \
+    --with-rc \
+    --with-rdmacm \
+    --with-mlx5 \
     && make -j \
     && make -j install-strip \
-    && ldconfig
+    && ldconfig \
+    && rm -rf /usr/local/src/ucx
 
 RUN pip install meson ninja pybind11
-COPY --from=nixl ./ /mnt/nixl
-RUN mkdir -p /usr/local/src/nixl \
-    && cd /usr/local/src/nixl \
-    && cp -r /mnt/nixl/* . \
-    && mkdir build \
+ARG RIXL_BRANCH=develop
+RUN --mount=type=cache,target=/var/cache/rixl \
+    if [ ! -d /var/cache/rixl/RIXL ]; then \
+    cd /var/cache/rixl && git clone https://github.com/ROCm/RIXL.git; \
+    fi \
+    && mkdir -p /usr/local/src/rixl \
+    && cp -r /var/cache/rixl/RIXL /usr/local/src/rixl/ \
+    && cd /usr/local/src/rixl/RIXL \
+    && git fetch origin && git checkout ${RIXL_BRANCH} && git pull origin ${RIXL_BRANCH} \
     && meson setup build/ --buildtype=release --prefix=/usr \
-    -Ducx_path=/usr/lib/ucx \
-    -Dcudapath_inc=/opt/rocm/include \
-    -Dcudapath_lib=/opt/rocm/lib \
-    -Ddisable_gds_backend=true \
+    -Ducx_path=/usr \
+    -Drocm_path=/opt/rocm \
+    -Duse_rocm=true \
     -Dwerror=false \
     && ninja -C build \
     && ninja -C build install \
     && ldconfig \
     && pip install . \
-    --config-settings=setup-args="-Dcudapath_inc=/opt/rocm/include" \
-    --config-settings=setup-args="-Dcudapath_lib=/opt/rocm/lib" \
-    --config-settings=setup-args="-Ducx_path=/usr/lib/ucx" \
-    --config-settings=setup-args="-Ddisable_gds_backend=true" \
+    --config-settings=setup-args="-Drocm_path=/opt/rocm" \
+    --config-settings=setup-args="-Duse_rocm=true" \
+    --config-settings=setup-args="-Ducx_path=/usr" \
     --config-settings=setup-args="-Dwerror=false" \
-    && rm -rf /usr/local/src/nixl
+    && rm -rf /usr/local/src/rixl
 
-ENV LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu/plugins/:/opt/nixl/lib:/usr/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+RUN --mount=type=cache,target=/var/cache/lmcache \
+    if [ ! -d /var/cache/lmcache/LMCache ]; then \
+    cd /var/cache/lmcache && git clone https://github.com/LMCache/LMCache.git; \
+    fi \
+    && mkdir -p /usr/local/src/lmcache \
+    && cp -r /var/cache/lmcache/LMCache /usr/local/src/lmcache/ \
+    && cd /usr/local/src/lmcache/LMCache \
+    && git switch -d ${LMCACHE_VERSION} \
+    && PYTORCH_ROCM_ARCH="gfx90a" \
+    TORCH_DONT_CHECK_COMPILER_ABI=1 \
+    CXX=hipcc \
+    BUILD_WITH_HIP=1 \
+    pip install --no-build-isolation . \
+    && rm -rf /usr/local/src/lmcache
+
+RUN --mount=type=cache,target=/var/cache/mooncake \
+    if [ ! -d /var/cache/mooncake/Mooncake ]; then \
+    cd /var/cache/mooncake && git clone https://github.com/kvcache-ai/Mooncake; \
+    fi \
+    && mkdir -p /usr/local/src/mooncake \
+    && cp -r /var/cache/mooncake/Mooncake /usr/local/src/mooncake/ \
+    && cd /usr/local/src/mooncake/Mooncake \
+    && git switch -d ${MOONCAKE_VERSION} \
+    && bash dependencies.sh \
+    && mkdir build \
+    && cd build \
+    && cmake .. -DUSE_CUDA=OFF -DUSE_HIP=ON -DWITH_STORE=ON -DUSE_TCP=ON -DUSE_RDMA=ON -DBUILD_EXAMPLES=OFF -DBUILD_UNIT_TESTS=OFF \
+    && make -j \
+    && make install \
+    && rm -rf /usr/local/src/mooncake
+
+RUN pip install --no-cache-dir \
+    'opentelemetry-sdk>=1.26.0' \
+    'opentelemetry-api>=1.26.0' \
+    'opentelemetry-exporter-otlp>=1.26.0' \
+    'opentelemetry-semantic-conventions-ai>=0.4.1'
+
+
+# Set LD_LIBRARY_PATH for RIXL to find UCX plugin
+ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/plugins:/usr/lib:/opt/rocm/lib:${LD_LIBRARY_PATH}
 
 ENV TOKENIZERS_PARALLELISM=false
 
