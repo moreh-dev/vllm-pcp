@@ -209,29 +209,27 @@ RUN --mount=type=cache,target=/var/cache/ucx \
     && rm -rf /usr/local/src/ucx
 
 RUN pip install meson ninja pybind11
-ARG RIXL_BRANCH=develop
-RUN --mount=type=cache,target=/var/cache/rixl \
-    if [ ! -d /var/cache/rixl/RIXL ]; then \
-    cd /var/cache/rixl && git clone https://github.com/ROCm/RIXL.git; \
-    fi \
-    && mkdir -p /usr/local/src/rixl \
-    && cp -r /var/cache/rixl/RIXL /usr/local/src/rixl/ \
-    && cd /usr/local/src/rixl/RIXL \
-    && git fetch origin && git checkout ${RIXL_BRANCH} && git pull origin ${RIXL_BRANCH} \
+COPY --from=nixl ./ /mnt/nixl
+RUN mkdir -p /usr/local/src/nixl \
+    && cd /usr/local/src/nixl \
+    && cp -r /mnt/nixl/* . \
+    && mkdir build \
     && meson setup build/ --buildtype=release --prefix=/usr \
-    -Ducx_path=/usr \
-    -Drocm_path=/opt/rocm \
-    -Duse_rocm=true \
+    -Ducx_path=/usr/lib/ucx \
+    -Dcudapath_inc=/opt/rocm/include \
+    -Dcudapath_lib=/opt/rocm/lib \
+    -Ddisable_gds_backend=true \
     -Dwerror=false \
     && ninja -C build \
     && ninja -C build install \
     && ldconfig \
     && pip install . \
-    --config-settings=setup-args="-Drocm_path=/opt/rocm" \
-    --config-settings=setup-args="-Duse_rocm=true" \
-    --config-settings=setup-args="-Ducx_path=/usr" \
+    --config-settings=setup-args="-Dcudapath_inc=/opt/rocm/include" \
+    --config-settings=setup-args="-Dcudapath_lib=/opt/rocm/lib" \
+    --config-settings=setup-args="-Ducx_path=/usr/lib/ucx" \
+    --config-settings=setup-args="-Ddisable_gds_backend=true" \
     --config-settings=setup-args="-Dwerror=false" \
-    && rm -rf /usr/local/src/rixl
+    && rm -rf /usr/local/src/nixl
 
 RUN --mount=type=cache,target=/var/cache/lmcache \
     if [ ! -d /var/cache/lmcache/LMCache ]; then \
@@ -272,7 +270,7 @@ RUN pip install --no-cache-dir \
 
 
 # Set LD_LIBRARY_PATH for RIXL to find UCX plugin
-ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/plugins:/usr/lib:/opt/rocm/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu/plugins/:/opt/nixl/lib:/usr/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
 
 ENV TOKENIZERS_PARALLELISM=false
 
