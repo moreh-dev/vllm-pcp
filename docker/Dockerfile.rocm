@@ -209,6 +209,7 @@ RUN --mount=type=cache,target=/var/cache/ucx \
     && rm -rf /usr/local/src/ucx
 
 RUN pip install meson ninja pybind11
+COPY --from=nixl ./ /mnt/nixl
 RUN mkdir -p /usr/local/src/nixl \
     && cd /usr/local/src/nixl \
     && cp -r /mnt/nixl/* . \
