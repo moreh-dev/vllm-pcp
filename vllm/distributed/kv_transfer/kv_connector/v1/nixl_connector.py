@@ -124,6 +124,7 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     rp_size: int = 1  # Ring parallel size of remote prefill
+    block_token_offset: int = 0  # Token offset for chunked prefill all_reduce
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -142,6 +143,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
         save_to_host: bool = False,
+        block_token_offset: int = 0,
     ):
         # save and load are mutually exclusive
         assert load_remote_cache ^ save_to_host
@@ -156,6 +158,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
             rp_size=kv_transfer_params.get("rp_size", 1),
+            block_token_offset=block_token_offset,
         )
         if save_to_host:
             self.reqs_to_save[request_id] = _req
@@ -384,9 +387,9 @@ class NixlConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        # tuple[Request, list[int]] -> tuple[Request, list[int], int] (req, blocks, seq_len)
+        # tuple: (Request, list[int], int, int) = (req, blocks, seq_len, block_token_offset)
         self._reqs_need_recv: dict[ReqId, tuple[Request, list[int], int]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Request, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Request, list[int], int, int]] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
         self._reqs_in_batch: set[ReqId] = set()
@@ -547,7 +550,10 @@ class NixlConnectorScheduler:
             # block is not overwritten; and it will be safe to skip saving them
             # to host xfer buffer.
             if block_ids:
-                self._reqs_need_save[request.request_id] = (request, block_ids, seq_len)
+                self._reqs_need_save[request.request_id] = (
+                    request, block_ids, seq_len,
+                    request.num_computed_tokens,
+                )
         elif params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(
@@ -598,7 +604,8 @@ class NixlConnectorScheduler:
                 save_to_host=False,
             )
 
-        for req_id, (req, block_ids, seq_len) in self._reqs_need_save.items():
+        for req_id, (req, block_ids, seq_len,
+                     block_token_offset) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req(
                 request_id=req_id,
@@ -607,6 +614,7 @@ class NixlConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
                 load_remote_cache=False,
                 save_to_host=True,
+                block_token_offset=block_token_offset,
             )
 
         meta.reqs_to_send = self._reqs_need_send
@@ -1463,7 +1471,7 @@ class NixlConnectorWorker:
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id] = nixl_agent_meta.kv_caches_base_addr
 
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size, rp_rank)
 
         # Number of D TP workers reading from a single P TP worker.
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(engine_id)
@@ -1518,7 +1526,8 @@ class NixlConnectorWorker:
         return remote_agent_name
 
     def _validate_remote_agent_handshake(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int,
+        rp_rank: int = 0,
     ):
         """
         Validate the remote agent handshake metadata ensuring the
@@ -1585,7 +1594,7 @@ class NixlConnectorWorker:
             )
 
         # TP workers have same #blocks.
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        assert self.dst_num_blocks[(remote_engine_id, rp_rank)] == nixl_agent_meta.num_blocks
 
         assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
 
@@ -1612,8 +1621,10 @@ class NixlConnectorWorker:
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata):
         """copy kv from device to host buffer.
-        With P2P RP transfer, allgather is skipped - each RP rank keeps its
-        own KV data and decode reads directly from each rank."""
+        With P2P RP transfer, each RP rank keeps its own KV data and decode
+        reads directly from each rank.  An all-reduce on boundary blocks
+        ensures every rank has complete KV for blocks that span two RP
+        rank token ranges."""
 
         # Determine if we need to copy to host
         do_host_copy = self.use_host_buffer and self.copy_blocks is not None
@@ -1623,8 +1634,18 @@ class NixlConnectorWorker:
                 meta.local_block_ids
             )
 
-            # No allgather: each RP rank's KV stays local for P2P transfer.
-            # Decode side reads directly from each RP rank.
+            # All-reduce KV across RP ranks so every rank has complete data
+            # for P2P transfer.  Each RP rank owns a zigzag slice of the
+            # sequence; the SUM across ranks assembles the full KV so any
+            # RP rank can serve any block via NIXL RDMA.
+            # block_idx_offset handles chunked prefill: the second+ chunk
+            # has tokens starting at block_token_offset, not 0.
+            block_idx_offset = meta.block_token_offset // self.block_size
+            self._allgather_rp_kv(
+                meta.local_physical_block_ids,
+                meta.seq_len,
+                block_idx_offset=block_idx_offset,
+            )
 
             # Copy to Host Buffer (if needed)
             if do_host_copy:
@@ -1949,7 +1970,9 @@ class NixlConnectorWorker:
         """Compute which block indices belong to which RP rank.
 
         Uses the zigzag pattern from ring attention to determine token
-        ownership, then maps token ranges to block indices.
+        ownership, then maps token ranges to block indices.  Each block
+        is assigned to exactly one RP rank (the one owning the block's
+        first token) to avoid racing RDMA writes to the same local block.
 
         Args:
             seq_len: Total sequence length.
@@ -1962,23 +1985,21 @@ class NixlConnectorWorker:
         rp_align = 2 * rp_size
         ring_chunk_len = (seq_len + rp_align - 1) // rp_align
         num_blocks = (seq_len + block_size - 1) // block_size
+        half = rp_size * ring_chunk_len
 
         mapping: dict[int, list[int]] = defaultdict(list)
-        for rp_rank in range(rp_size):
-            # Head interval
-            head_start = ring_chunk_len * rp_rank
-            head_end = min(head_start + ring_chunk_len, seq_len)
-            # Tail interval (zigzag mirror)
-            tail_start = ring_chunk_len * (2 * rp_size - 1 - rp_rank)
-            tail_end = min(tail_start + ring_chunk_len, seq_len)
-
-            for start, end in [(head_start, head_end), (tail_start, tail_end)]:
-                if end > start:
-                    block_start = start // block_size
-                    block_end = (end - 1) // block_size + 1
-                    mapping[rp_rank].extend(
-                        range(block_start, min(block_end, num_blocks))
-                    )
+        for block_idx in range(num_blocks):
+            first_token = block_idx * block_size
+            if first_token >= seq_len:
+                break
+            # Determine which RP rank owns the first token of this block.
+            chunk_idx = first_token // ring_chunk_len
+            if first_token < half:
+                rp_rank = chunk_idx  # head region
+            else:
+                rp_rank = 2 * rp_size - 1 - chunk_idx  # tail region
+            rp_rank = min(rp_rank, rp_size - 1)
+            mapping[rp_rank].append(block_idx)
         return dict(mapping)
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
@@ -2000,6 +2021,23 @@ class NixlConnectorWorker:
             )
             return
 
+        # Full cache hit with RP: notify all RP rank agents and return early.
+        if len(meta.local_physical_block_ids) == 0:
+            tp_ratio = self.kv_topo.tp_ratio_from_engine_id(engine_id)
+            notif_id = f"{req_id}:{tp_ratio}".encode()
+            for rp_rk, agent_name in self._remote_agents[engine_id].items():
+                try:
+                    self.nixl_wrapper.send_notif(
+                        agent_name, notif_msg=notif_id)
+                except Exception:
+                    logger.exception(
+                        "NIXL send_notif failed for request %s rp_rank %s: "
+                        "P worker blocks will be freed after timeout.",
+                        req_id, rp_rk,
+                    )
+                    self.xfer_stats.record_failed_notification()
+            return
+
         # P2P multi-RP case: split blocks by RP rank using zigzag mapping.
         rp_block_mapping = self.compute_rp_block_mapping(
             meta.seq_len, remote_rp_size, self.block_size,
@@ -2008,21 +2046,52 @@ class NixlConnectorWorker:
         all_remote = np.array(meta.remote_block_ids)
         all_local = np.array(meta.local_physical_block_ids)
 
+        # For partial cache hits: first `block_offset` blocks are already
+        # cached on D side.  Only the trailing `num_local` blocks need RDMA.
+        num_remote = len(all_remote)
+        num_local = len(all_local)
+        block_offset = num_remote - num_local
+
+        # Notification token so P workers know when to free blocks.
+        tp_ratio = self.kv_topo.tp_ratio_from_engine_id(engine_id)
+        notif_id = f"{req_id}:{tp_ratio}".encode()
+
         logger.debug(
             "P2P multi-RP read for req %s: distributing %d blocks "
-            "across %d RP ranks",
-            req_id, len(all_remote), remote_rp_size,
+            "across %d RP ranks (block_offset=%d)",
+            req_id, num_remote, remote_rp_size, block_offset,
         )
 
         for rp_rank, block_indices in rp_block_mapping.items():
             indices = np.array(block_indices)
-            # Clip to actual block count
-            indices = indices[indices < len(all_remote)]
-            if len(indices) == 0:
+            # Clip to actual block count (handles seq_len padding)
+            indices = indices[indices < num_remote]
+
+            # Among the global indices, only those >= block_offset are not
+            # yet cached on the D side and require an RDMA fetch.
+            fetch_indices = indices[indices >= block_offset]
+
+            if len(fetch_indices) == 0:
+                # All blocks for this RP rank are already cached — send a
+                # notification so the P worker can free its blocks.
+                agent_name = self._remote_agents.get(engine_id, {}).get(rp_rank)
+                if agent_name is not None:
+                    try:
+                        self.nixl_wrapper.send_notif(
+                            agent_name, notif_msg=notif_id)
+                    except Exception:
+                        logger.exception(
+                            "NIXL send_notif failed for request %s "
+                            "rp_rank %s (cached-hit path): "
+                            "P worker blocks will be freed after timeout.",
+                            req_id, rp_rank,
+                        )
+                        self.xfer_stats.record_failed_notification()
                 continue
 
-            rp_remote_blocks = all_remote[indices].tolist()
-            rp_local_blocks = all_local[indices].tolist()
+            rp_remote_blocks = all_remote[fetch_indices].tolist()
+            # Map global block index → local (uncached) block index
+            rp_local_blocks = all_local[fetch_indices - block_offset].tolist()
 
             logger.debug(
                 "  rp_rank=%d: reading %d blocks",
@@ -2269,107 +2338,169 @@ class NixlConnectorWorker:
         self._invalid_block_ids = set()
         return result
 
-    def _allgather_rp_kv(self, block_ids: list[int], seq_len: int = 0) -> None:
+    def _allgather_rp_kv(
+        self,
+        block_ids: list[int],
+        seq_len: int = 0,
+        block_idx_offset: int = 0,
+    ) -> None:
         """
-        Gather KV cache from all RP ranks to rp_rank=0.
-        The KV cache is sharded along seq_len dimension in zigzag pattern.
+        Gather KV cache from all RP ranks so every rank has complete KV data.
+        The KV cache is sharded along the seq_len dimension in a zigzag pattern.
+
+        block_ids must be ordered by global token position (block 0 first, i.e.
+        block_ids[i] is the physical block for tokens
+        [(i+block_idx_offset)*block_size, ...)).
+        block_idx_offset is non-zero for chunked prefill: the second+ chunk
+        starts at token block_idx_offset*block_size, not token 0.
+        This is the natural order returned by blocks.get_block_ids()[0].
         """
         if self.rp_size <= 1:
             return
 
         if seq_len == 0:
+            logger.warning("_allgather_rp_kv: seq_len=0, skipping")
+            return
+
+        if not block_ids:
+            logger.warning("_allgather_rp_kv: empty block_ids, skipping")
             return
 
         # Prepare gathering
         rp_group = get_rp_group()
         rank = rp_group.rank_in_group
-        
+
+        num_blocks = len(block_ids)
         rp_align = 2 * self.rp_size
-        ring_chunk_len = (seq_len + rp_align - 1) // rp_align
-        
-        # Owned intervals: [head_start, head_end) and [tail_start, tail_end)
-        head_start = ring_chunk_len * rank
-        head_end = min(head_start + ring_chunk_len, seq_len)
-        
-        tail_start = ring_chunk_len * (2 * self.rp_size - 1 - rank)
-        tail_end = min(tail_start + ring_chunk_len, seq_len)
-        
-        if head_start >= seq_len:
-            head_start = head_end = 0
-        if tail_start >= seq_len:
-            tail_start = tail_end = 0
-            
-        owned_intervals = []
-        if head_end > head_start:
-            owned_intervals.append((head_start, head_end))
-        if tail_end > tail_start:
-            owned_intervals.append((tail_start, tail_end))
 
-        # Iterate over all layers
-        for cache in self.device_kv_caches.values():
-            if len(block_ids) == 0:
-                continue
+        # chunk_len is the number of tokens covered by block_ids in this call.
+        # For chunked prefill the second+ call only covers a subset of seq_len.
+        # The model_runner computes ring_chunk_len from num_scheduled_tokens
+        # (i.e. per-chunk), not from seq_len, so we must match that here.
+        chunk_start_token = block_idx_offset * self.block_size
+        chunk_len = min(seq_len - chunk_start_token,
+                        num_blocks * self.block_size)
+        ring_chunk_len = (chunk_len + rp_align - 1) // rp_align
 
-            # Select blocks [num_blocks_to_xfer, ...]
-            # Advanced indexing creates a COPY.
-            selected_blocks = cache[block_ids]
-            
-            # Construct a mask tensor on the same device
-            num_blocks = len(block_ids)
-            mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool)
-            
-            for i in range(num_blocks):
-                block_start_token = i * self.block_size
-                block_end_token = block_start_token + self.block_size
-                
-                # Check intersection with owned intervals
-                # Check against head
-                head_overlap_start = max(block_start_token, head_start)
-                head_overlap_end = min(block_end_token, head_end)
-                
-                if head_overlap_end > head_overlap_start:
-                    m_start = head_overlap_start - block_start_token
-                    m_end = head_overlap_end - block_start_token
-                    mask[i, m_start:m_end] = True
-                    
-                # Check against tail
-                tail_overlap_start = max(block_start_token, tail_start)
-                tail_overlap_end = min(block_end_token, tail_end)
-                
-                if tail_overlap_end > tail_overlap_start:
-                    m_start = tail_overlap_start - block_start_token
-                    m_end = tail_overlap_end - block_start_token
-                    mask[i, m_start:m_end] = True
-            
-            mask = mask.to(selected_blocks.device)
-            
-            dims = selected_blocks.shape
-            block_dim_idx = -1
-            for idx, dim in enumerate(dims):
-                if dim == self.block_size:
-                    block_dim_idx = idx
-                    break
-            
-            if block_dim_idx != -1:
-                # Reshape mask
+        # Owned intervals are CHUNK-RELATIVE: [0, chunk_len).
+        # This matches gpu_model_runner.py which computes head/tail relative to
+        # the current chunk's token range, not the global sequence.
+        head_start_rel = ring_chunk_len * rank
+        head_end_rel = min(head_start_rel + ring_chunk_len, chunk_len)
+
+        tail_start_rel = ring_chunk_len * (2 * self.rp_size - 1 - rank)
+        tail_end_rel = min(tail_start_rel + ring_chunk_len, chunk_len)
+
+        if head_start_rel >= chunk_len:
+            head_start_rel = head_end_rel = 0
+        if tail_start_rel >= chunk_len:
+            tail_start_rel = tail_end_rel = 0
+
+        logger.info(
+            "_allgather_rp_kv: rank=%d/%d seq_len=%d chunk_len=%d "
+            "num_blocks=%d block_size=%d ring_chunk_len=%d block_idx_offset=%d "
+            "head_rel=[%d,%d) tail_rel=[%d,%d)",
+            rank, self.rp_size, seq_len, chunk_len, num_blocks,
+            self.block_size, ring_chunk_len, block_idx_offset,
+            head_start_rel, head_end_rel, tail_start_rel, tail_end_rel,
+        )
+
+        # Build token-position mask using CHUNK-RELATIVE positions.
+        # block_ids[i] covers chunk-relative tokens [i*block_size, (i+1)*block_size).
+        # (The global offset block_idx_offset cancels out because both the
+        #  model_runner intervals and our block indices are chunk-relative here.)
+        mask = torch.zeros((num_blocks, self.block_size), dtype=torch.bool)
+        for i in range(num_blocks):
+            blk_rel_s = i * self.block_size
+            blk_rel_e = blk_rel_s + self.block_size
+
+            # Intersection with head-owned interval
+            head_ov_s = max(blk_rel_s, head_start_rel)
+            head_ov_e = min(blk_rel_e, head_end_rel)
+            if head_ov_e > head_ov_s:
+                mask[i, head_ov_s - blk_rel_s:head_ov_e - blk_rel_s] = True
+
+            # Intersection with tail-owned interval
+            tail_ov_s = max(blk_rel_s, tail_start_rel)
+            tail_ov_e = min(blk_rel_e, tail_end_rel)
+            if tail_ov_e > tail_ov_s:
+                mask[i, tail_ov_s - blk_rel_s:tail_ov_e - blk_rel_s] = True
+
+        owned_tokens = mask.sum().item()
+        logger.info(
+            "_allgather_rp_kv rank=%d: owned_tokens=%d / %d total",
+            rank, owned_tokens, num_blocks * self.block_size,
+        )
+
+        # Whether K and V are stored as separate tensors per layer.
+        split_k_and_v = self.kv_topo.split_k_and_v
+
+        logged_first = False
+        # Iterate over all layers.  Each value may be a single tensor
+        # (FlashInfer / blocks-first layout) or a list of two tensors
+        # [K, V] (FA2 split_k_and_v layout).
+        for cache_or_caches in self.device_kv_caches.values():
+            cache_list = (cache_or_caches
+                          if split_k_and_v else [cache_or_caches])
+            for cache in cache_list:
+                # Advanced indexing creates a COPY.
+                selected_blocks = cache[block_ids]
+
+                # Find the dimension that corresponds to per-block token
+                # positions (size == block_size) so we can broadcast the mask.
+                dims = selected_blocks.shape
+                block_dim_idx = -1
+                for idx, dim in enumerate(dims):
+                    # Skip dim 0 (num_blocks) — always look from dim 1 onwards.
+                    if idx > 0 and dim == self.block_size:
+                        block_dim_idx = idx
+                        break
+
+                if not logged_first and rank == 0:
+                    logger.info(
+                        "_allgather_rp_kv rank=%d: cache shape=%s "
+                        "selected_blocks shape=%s block_dim_idx=%d "
+                        "pre_norm=%.4f",
+                        rank, cache.shape, selected_blocks.shape, block_dim_idx,
+                        selected_blocks.float().norm().item(),
+                    )
+
+                if block_dim_idx == -1:
+                    # Cannot determine token-position dimension; skip this cache.
+                    logger.warning(
+                        "_allgather_rp_kv rank=%d: block_dim_idx=-1 for shape %s, "
+                        "skipping layer",
+                        rank, selected_blocks.shape,
+                    )
+                    continue
+
+                # Move mask to the cache device and expand to cache shape.
                 view_shape = [1] * len(dims)
                 view_shape[0] = num_blocks
                 view_shape[block_dim_idx] = self.block_size
-                mask = mask.view(view_shape)
+                dev_mask = mask.to(selected_blocks.device).view(view_shape)
 
-                # Apply mask: Zero out where mask is False (not owned)
-                selected_blocks.masked_fill_(~mask, 0)
+                # Zero out token positions not owned by this rank.
+                selected_blocks.masked_fill_(~dev_mask, 0)
 
-                # All-reduce (SUM) across RP group
+                # All-reduce SUM across RP group → each rank gets complete KV.
                 torch.distributed.all_reduce(
                     selected_blocks,
                     op=torch.distributed.ReduceOp.SUM,
-                    group=rp_group.device_group
+                    group=rp_group.device_group,
                 )
 
-                # Copy back result to rank 0
-                if rank == 0:
-                    cache[block_ids] = selected_blocks
+                if not logged_first and rank == 0:
+                    logger.info(
+                        "_allgather_rp_kv rank=%d layer0: post_norm=%.4f",
+                        rank, selected_blocks.float().norm().item(),
+                    )
+                    logged_first = True
+
+                # Write the complete KV back so NIXL RDMA reads correct data.
+                cache[block_ids] = selected_blocks
+
+        logger.info("_allgather_rp_kv rank=%d: all layers done", rank)
 
     def __del__(self):
         self.shutdown()
