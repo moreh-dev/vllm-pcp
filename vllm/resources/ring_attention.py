@@ -527,6 +527,9 @@ def _mla_ring_attention_full(
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
     assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
     assert causal is True, "Balanced Ring Attention requires causal=True."
+    ulysses_pg = getattr(module, 'ulysses_pg', None)
+    ulysses_size = dist.get_world_size(ulysses_pg) if ulysses_pg is not None else 1
+    assert ulysses_size == 1, "MLA ring attention does not support Ulysses sequence parallelism."
 
     comm = RingComm(module.ring_pg)
 
@@ -674,6 +677,8 @@ def _gpt_ring_attention_full(
     assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
     assert causal is True, "Balanced Ring Attention requires causal=True."
 
+    ulysses_size = dist.get_world_size(module.ulysses_pg)
+
     comm = RingComm(module.ring_pg)
 
     global _WARMUPED
@@ -688,9 +693,17 @@ def _gpt_ring_attention_full(
         received_tensor += 1.0
         _WARMUPED = True
 
-    query_layer = query
-    key_layer = key
-    value_layer = value
+    if ulysses_size > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+        ulysses_rank = dist.get_rank(module.ulysses_pg)
+        if sinks is not None:
+            sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
@@ -765,7 +778,10 @@ def _gpt_ring_attention_full(
             value_layer = next_v
 
     out = out.to(query.dtype)
-    output = out
+    if ulysses_size > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
 
     return output
 
@@ -787,6 +803,8 @@ def _gpt_ring_attention_windowed(
     assert window_size[1] == -1, "Only left-side window size is supported in balanced ring attention."
     assert causal is True, "Balanced Ring Attention requires causal=True."
 
+    ulysses_size = dist.get_world_size(module.ulysses_pg)
+
     comm0 = RingComm(module.ring_pg)
     comm1 = RingComm(module.ring_pg)
     comm1.send_rank, comm1.recv_rank = comm1.recv_rank, comm1.send_rank
@@ -804,9 +822,17 @@ def _gpt_ring_attention_windowed(
             received_tensor += 1.0
         _WARMUPED = True
 
-    query_layer = query
-    key_layer = key
-    value_layer = value
+    if ulysses_size > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+        ulysses_rank = dist.get_rank(module.ulysses_pg)
+        if sinks is not None:
+            sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
@@ -901,4 +927,6 @@ def _gpt_ring_attention_windowed(
             value_layer1 = next_v1
 
     out = out.to(query.dtype)
+    if ulysses_size > 1:
+        return SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
     return out
