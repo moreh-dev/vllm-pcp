@@ -245,9 +245,9 @@ from vllm.resources.ring_attention import (
     AttnType,
     RingComm,
     SeqAllToAll4D,
-    moreh_gpt_attention,
-    _moreh_gpt_attention_balanced_full,
-    _moreh_mla_ring_attention_balanced_full,
+    gpt_ring_attention,
+    _gpt_ring_attention_full,
+    _mla_ring_attention_full,
 )
 
 
@@ -2048,7 +2048,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                  k_pe_in = k_pe.unsqueeze(0)
 
                  # Call Compressed Ring Attention
-                 ring_out = _moreh_mla_ring_attention_balanced_full(
+                 ring_out = _mla_ring_attention_full(
                     self,
                     q_in,
                     kv_c_normed_in,
@@ -2085,7 +2085,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 v_in = v_in.unsqueeze(0)
 
                 # Call Ring Attention (MLA does not use sinks)
-                ring_out = _moreh_gpt_attention_balanced_full(
+                ring_out = _gpt_ring_attention_full(
                     self,
                     q_in,
                     k_in,

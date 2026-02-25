@@ -470,7 +470,7 @@ def call_block_attn(
     return out, lse
 
 
-def moreh_gpt_attention(
+def gpt_ring_attention(
     module,
     query,
     key,
@@ -484,7 +484,7 @@ def moreh_gpt_attention(
     is_kernel_bhsd: bool = True,
 ) -> torch.Tensor:
     if window_size[0] == -1:
-        return _moreh_gpt_attention_balanced_full(
+        return _gpt_ring_attention_full(
             module,
             query,
             key,
@@ -497,7 +497,7 @@ def moreh_gpt_attention(
             is_kernel_bhsd=is_kernel_bhsd,
         )
     else:
-        return _moreh_gpt_attention_balanced_window(
+        return _gpt_ring_attention_windowed(
             module,
             query,
             key,
@@ -511,7 +511,7 @@ def moreh_gpt_attention(
         )
 
 
-def _moreh_mla_ring_attention_balanced_full(
+def _mla_ring_attention_full(
     module,
     query,
     kv_c_normed,
@@ -657,7 +657,7 @@ def _moreh_mla_ring_attention_balanced_full(
     return output
 
 
-def _moreh_gpt_attention_balanced_full(
+def _gpt_ring_attention_full(
     module,
     query,
     key,
@@ -770,7 +770,7 @@ def _moreh_gpt_attention_balanced_full(
     return output
 
 
-def _moreh_gpt_attention_balanced_window(
+def _gpt_ring_attention_windowed(
     module,
     query,
     key,

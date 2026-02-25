@@ -23,7 +23,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
-from vllm.resources.ring_attention import moreh_gpt_attention
+from vllm.resources.ring_attention import gpt_ring_attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -142,7 +142,7 @@ class OAIAttention(nn.Module):
             self.ulysses_pg = get_up_group().device_group
         except AssertionError:
             self.ulysses_pg = None
-        self.use_pack_qkv = False  # required by moreh_gpt_attention
+        self.use_pack_qkv = False  # required by gpt_ring_attention
         self._ring_sliding_window = sliding_window  # window size for ring attn
 
     def forward(
@@ -197,7 +197,7 @@ class OAIAttention(nn.Module):
         k_4d = k_3d.unsqueeze(0)
         v_4d = v_3d.unsqueeze(0)
 
-        ring_out = moreh_gpt_attention(
+        ring_out = gpt_ring_attention(
             self,
             q_4d,
             k_4d,
