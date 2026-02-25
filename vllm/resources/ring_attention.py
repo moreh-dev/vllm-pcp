@@ -19,6 +19,264 @@ from yunchang.globals import PROCESS_GROUP
 from yunchang.kernels import AttnType
 from yunchang.ring.utils import RingComm, update_out_and_lse
 
+configs = []
+for block_q in [8, 16, 32]:
+    for block_n in [32, 64, 128]:
+        for num_warps in [4, 8]:
+            configs.append(triton.Config({"BLOCK_Q_PER_HEAD": block_q, "BLOCK_N": block_n}, num_warps=num_warps))
+
+
+@triton.autotune(
+    configs=configs,
+    key=["q_seq_len", "kv_seq_len", "IS_CAUSAL", "WINDOW_SIZE_PAST"],
+)
+@triton.jit
+def kernel_attention_contiguous_vllm_ported(
+    output_ptr,
+    lse_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    sinks_ptr,
+    alibi_slopes_ptr,  # [num_query_heads]
+    qq_bias_ptr,  # [q_seq_len, q_seq_len]
+    stride_out_batch,
+    stride_out_seq,
+    stride_out_head,
+    stride_lse_batch,
+    stride_lse_head,
+    stride_lse_seq,
+    stride_q_batch,
+    stride_q_seq,
+    stride_q_head,
+    stride_k_batch,
+    stride_k_seq,
+    stride_k_head,
+    stride_v_batch,
+    stride_v_seq,
+    stride_v_head,
+    qq_bias_stride_0,  # int (qq_bias.stride(0))
+    q_seq_len,
+    kv_seq_len,
+    scale,
+    k_scale,  # float32
+    v_scale,  # float32
+    out_scale,  # float32
+    BLOCK_Q_PER_HEAD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_QUERIES_PER_KV: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    WINDOW_SIZE_PAST: tl.constexpr,
+    WINDOW_SIZE_FUTURE: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
+):
+    BLOCK_M_FUSED: tl.constexpr = BLOCK_Q_PER_HEAD * NUM_QUERIES_PER_KV
+
+    batch_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    start_m_q_pos = tl.program_id(2) * BLOCK_Q_PER_HEAD
+    offs_m_fused = tl.arange(0, BLOCK_M_FUSED)
+    offs_q_pos = start_m_q_pos + (offs_m_fused // NUM_QUERIES_PER_KV)
+    offs_q_head_offset = offs_m_fused % NUM_QUERIES_PER_KV
+    head_idx = kv_head_idx * NUM_QUERIES_PER_KV + offs_q_head_offset
+
+    k_ptrs_base = key_ptr + (batch_idx * stride_k_batch + kv_head_idx * stride_k_head)
+    v_ptrs_base = value_ptr + (batch_idx * stride_v_batch + kv_head_idx * stride_v_head)
+
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    d_mask = offs_d < HEAD_SIZE
+    d_mask_q_v = d_mask[None, :]
+    d_mask_k = d_mask[:, None]
+    q_mask = offs_q_pos < q_seq_len
+
+    q_ptrs = (
+        query_ptr
+        + batch_idx * stride_q_batch
+        + offs_q_pos[:, None] * stride_q_seq
+        + head_idx[:, None] * stride_q_head
+        + offs_d[None, :]
+    )
+
+    acc = tl.zeros([BLOCK_M_FUSED, HEAD_SIZE_PADDED], dtype=tl.float32)
+    m_i = tl.load(sinks_ptr + head_idx, mask=q_mask, other=float("-inf")).to(tl.float32)
+    l_i = tl.full([BLOCK_M_FUSED], 1.0, dtype=tl.float32)
+
+    q = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask_q_v, other=0.0)
+    q = (q * scale).to(q.dtype)
+
+    if USE_ALIBI_SLOPES:
+        alibi_slope = tl.load(alibi_slopes_ptr + head_idx, mask=q_mask, other=0.0)
+
+    if USE_QQ_BIAS:
+        qq_bias_row_ptrs = qq_bias_ptr + offs_q_pos[:, None] * qq_bias_stride_0
+
+    end_n = kv_seq_len
+    start_n = 0
+    while start_n < end_n:
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_mask = offs_n[None, :] < kv_seq_len
+
+        k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
+        k_load = tl.load(k_ptrs, mask=k_mask & d_mask_k, other=0.0)
+
+        k = k_load
+
+        qk = tl.zeros([BLOCK_M_FUSED, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+
+        if USE_ALIBI_SLOPES:
+            alibi_bias = alibi_slope[:, None] * offs_n[None, :]
+            qk += alibi_bias
+
+        if USE_QQ_BIAS:
+            key_pos = offs_n[None, :]
+            qq_bias_mask = (key_pos >= 0) & (key_pos < q_seq_len)
+            qq_bias = tl.load(qq_bias_row_ptrs + key_pos, mask=qq_bias_mask & q_mask[:, None], other=0.0)
+            qk += qq_bias
+
+        mask = q_mask[:, None] & (offs_n[None, :] < kv_seq_len)
+        if IS_CAUSAL:
+            mask = mask & (offs_q_pos[:, None] >= offs_n[None, :])
+        if WINDOW_SIZE_PAST != -1:
+            past_mask = (offs_q_pos[:, None] - offs_n[None, :]) >= WINDOW_SIZE_PAST
+            qk = tl.where(past_mask, float("-inf"), qk)
+        if WINDOW_SIZE_FUTURE != -1:
+            future_mask = (offs_n[None, :] - offs_q_pos[None, :]) > WINDOW_SIZE_FUTURE
+            qk = tl.where(future_mask, float("-inf"), qk)
+
+        qk = tl.where(mask, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.exp(qk - m_ij[:, None])
+        l_j = tl.sum(p, 1)
+        m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+
+        alpha = tl.exp(m_i - m_ij)
+        acc = acc * alpha[:, None]
+
+        v_ptrs = v_ptrs_base + (offs_n[:, None] * stride_v_seq + offs_d[None, :])
+        v_mask = offs_n[:, None] < kv_seq_len
+        v_load = tl.load(v_ptrs, mask=v_mask & d_mask_q_v, other=0.0)
+        v = v_load
+
+        acc += tl.dot(p.to(v.dtype), v)
+
+        l_i = l_i * alpha + l_j
+        m_i = m_ij
+
+        start_n += BLOCK_N
+
+    lse = m_i + tl.log(l_i)
+    lse_ptrs = lse_ptr + (batch_idx * stride_lse_batch + head_idx * stride_lse_head + offs_q_pos * stride_lse_seq)
+    tl.store(lse_ptrs, lse, mask=q_mask)
+
+    acc = acc / l_i[:, None]
+
+    out_ptrs = output_ptr + (
+        batch_idx * stride_out_batch
+        + offs_q_pos[:, None] * stride_out_seq
+        + head_idx[:, None] * stride_out_head
+        + offs_d[None, :]
+    )
+    tl.store(out_ptrs, acc, mask=q_mask[:, None] & d_mask_q_v)
+
+
+def triton_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor | None = None,
+    scale: float = 1.0,
+    is_causal: bool = False,
+    window_size: tuple = (-1, -1),
+    alibi_slopes: torch.Tensor = None,
+    qq_bias: torch.Tensor = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    out_scale: float = 1.0,
+):
+
+    USE_ALIBI_SLOPES = alibi_slopes is not None
+    USE_QQ_BIAS = qq_bias is not None
+
+    batch_size, q_seq_len, num_query_heads, head_size = query.shape
+    _, kv_seq_len, num_kv_heads, _ = key.shape
+
+    if sinks is None:
+        sinks = torch.full(
+            (num_query_heads,), float("-inf"),
+            dtype=torch.float32, device=query.device,
+        )
+
+    assert sinks.numel() == num_query_heads
+
+    output = torch.empty_like(query)
+    lse_output = torch.empty((batch_size, num_query_heads, q_seq_len), dtype=torch.float32, device=query.device)
+
+    num_queries_per_kv = num_query_heads // num_kv_heads
+
+    def grid(meta):
+        return (
+            batch_size,
+            num_kv_heads,
+            triton.cdiv(q_seq_len, meta["BLOCK_Q_PER_HEAD"]),
+        )
+
+    PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
+
+    if alibi_slopes is None:
+        alibi_slopes = torch.empty(0, dtype=query.dtype, device=query.device)
+    if qq_bias is None:
+        qq_bias = torch.empty(0, dtype=query.dtype, device=query.device)
+
+    kernel_attention_contiguous_vllm_ported[grid](
+        output,
+        lse_output,
+        query,
+        key,
+        value,
+        sinks,
+        alibi_slopes,
+        qq_bias,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        lse_output.stride(0),
+        lse_output.stride(1),
+        lse_output.stride(2),
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        qq_bias.stride(0) if USE_QQ_BIAS else 0,
+        q_seq_len,
+        kv_seq_len,
+        scale,
+        k_scale,
+        v_scale,
+        out_scale,
+        NUM_QUERIES_PER_KV=num_queries_per_kv,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=PADDED_HEAD_SIZE,
+        IS_CAUSAL=is_causal,
+        WINDOW_SIZE_PAST=window_size[0],
+        WINDOW_SIZE_FUTURE=window_size[1],
+        USE_ALIBI_SLOPES=USE_ALIBI_SLOPES,
+        USE_QQ_BIAS=USE_QQ_BIAS,
+    )
+
+    return output, lse_output
+
+
 
 @torch.jit.script
 def _update_out_and_lse_inf_robust(
@@ -166,6 +424,7 @@ def call_block_attn(
     softmax_scale,
     causal,
     window_size,
+    sinks=None,
 ):
     # Padding for MLA where qk_head_dim != v_head_dim
     # q, k: [bs, seqlen, num_heads, qk_head_dim]
@@ -177,7 +436,9 @@ def call_block_attn(
 
     attn = "flash"
 
-    if window_size != (-1, -1):
+    # Force triton when windowed or when sinks are provided
+    # (flash-attn does not support sinks)
+    if window_size != (-1, -1) or sinks is not None:
         attn = "triton"
 
     if attn == "flash":
@@ -195,6 +456,7 @@ def call_block_attn(
             query,
             key,
             value,
+            sinks,
             scale=softmax_scale,
             is_causal=causal,
             window_size=window_size,
@@ -213,7 +475,7 @@ def moreh_gpt_attention(
     query,
     key,
     value,
-    sinks,
+    sinks=None,
     *,
     dropout_p=0.0,
     softmax_scale=None,
@@ -223,7 +485,7 @@ def moreh_gpt_attention(
 ) -> torch.Tensor:
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
 
-    ulysses_size = dist.get_world_size(module.ulysses_pg)
+    ulysses_size = dist.get_world_size(module.ulysses_pg) if module.ulysses_pg is not None else 1
     ring_size = dist.get_world_size(module.ring_pg)
 
     comm = RingComm(module.ring_pg)
@@ -283,6 +545,7 @@ def moreh_gpt_attention(
                 softmax_scale,
                 causal and step == 0,
                 adjusted_window_size,
+                sinks=sinks,
             )
 
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
@@ -303,7 +566,7 @@ def _moreh_mla_ring_attention_balanced_full(
     query,
     kv_c_normed,
     k_pe,
-    sinks,
+    sinks=None,
     *,
     dropout_p=0.0,
     softmax_scale=None,
@@ -449,7 +712,7 @@ def _moreh_gpt_attention_balanced_full(
     query,
     key,
     value,
-    sinks,
+    sinks=None,
     *,
     dropout_p=0.0,
     softmax_scale=None,
@@ -508,6 +771,7 @@ def _moreh_gpt_attention_balanced_full(
                 softmax_scale,
                 causal,
                 window_size,
+                sinks=sinks,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -523,6 +787,7 @@ def _moreh_gpt_attention_balanced_full(
                     softmax_scale,
                     False,
                     window_size,
+                    sinks=sinks,
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -534,6 +799,7 @@ def _moreh_gpt_attention_balanced_full(
                 softmax_scale,
                 False,
                 window_size,
+                sinks=sinks,
             )
             out, lse = update_out_and_lse(
                 out,
