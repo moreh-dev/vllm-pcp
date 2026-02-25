@@ -364,6 +364,15 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
 
+            # KVTransfer (P-side chunked prefill): for running requests
+            # in their 2nd+ chunk, update_state_after_alloc is not called
+            # during the waiting-queue phase.  Call it here so the new
+            # blocks are registered for the RP all-reduce in save_kv_to_host.
+            if self.connector is not None:
+                self.connector.update_state_after_alloc(
+                    request, new_blocks, 0
+                )
+
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (

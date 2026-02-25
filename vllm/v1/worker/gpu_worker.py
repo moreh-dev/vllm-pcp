@@ -378,7 +378,12 @@ class Worker(WorkerBase):
             return None
 
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        tp_size = get_tp_group().world_size
+        # Use composite key to distinguish RP ranks within the same TP group.
+        # With RP=1 (default), rp_rank=0 so key = tp_rank (backward compatible).
+        rp_rank = getattr(metadata, 'rp_rank', 0)
+        key = rp_rank * tp_size + tp_rank
+        return {key: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
