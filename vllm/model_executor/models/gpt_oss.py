@@ -164,34 +164,19 @@ class OAIAttention(nn.Module):
     def _forward_ring_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        from vllm.attention.ops.triton_reshape_and_cache_flash import (
-            triton_reshape_and_cache_flash,
-        )
-
         fwd_ctx = get_forward_context()
         attn_metadata = fwd_ctx.attn_metadata
         if isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata[self.attn.layer_name]
-        kv_cache = self.attn.kv_cache[fwd_ctx.virtual_engine]
+        assert attn_metadata.num_decode_tokens == 0, (
+            "Ring attention is only supported for prefill, not decode"
+        )
 
         num_tokens = q.shape[0]
         # Reshape: [S, NH*HD] -> [S, NH, HD]
         q_3d = q.view(num_tokens, self.num_local_attention_heads, self.head_dim)
         k_3d = k.view(num_tokens, self.num_local_key_value_heads, self.head_dim)
         v_3d = v.view(num_tokens, self.num_local_key_value_heads, self.head_dim)
-
-        # Write KV cache (triton layout: [num_blocks, 2, block_size, nh, hd])
-        key_cache, value_cache = kv_cache.unbind(1)
-        triton_reshape_and_cache_flash(
-            k_3d,
-            v_3d,
-            key_cache,
-            value_cache,
-            attn_metadata.slot_mapping,
-            self.attn.impl.kv_cache_dtype,
-            self.attn._k_scale,
-            self.attn._v_scale,
-        )
 
         # Slice sinks per ulysses rank if ulysses parallelism is used
         sinks = self.sinks
