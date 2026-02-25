@@ -483,82 +483,32 @@ def moreh_gpt_attention(
     window_size=(-1, -1),
     is_kernel_bhsd: bool = True,
 ) -> torch.Tensor:
-    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
-
-    ulysses_size = dist.get_world_size(module.ulysses_pg) if module.ulysses_pg is not None else 1
-    ring_size = dist.get_world_size(module.ring_pg)
-
-    comm = RingComm(module.ring_pg)
-
-    global _WARMUPED
-
-    if not _WARMUPED:
-        tensor = torch.empty_like(key)
-        received_tensor: torch.Tensor = comm.send_recv(tensor)
-        comm_stream = _get_ring_comm_stream()
-        with torch.cuda.stream(comm_stream):
-            comm.commit()
-        comm.wait()
-        received_tensor += 1.0
-        _WARMUPED = True
-
-    query_layer = query
-    key_layer = key
-    value_layer = value
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
-    comm = RingComm(module.ring_pg)
-    assert comm.world_size <= 16, "Ring Attention only supports up to 16 devices."
-
-    out = None
-    lse = None
-
-    next_k, next_v = None, None
-
-    original_window_size = window_size
-
-    chunk_len = query_layer.shape[1]
-    comm_stream = _get_ring_comm_stream()
-
-    for step in range(comm.world_size):
-        if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(key_layer)
-            next_v: torch.Tensor = comm.send_recv(value_layer)
-            comm.commit()
-
-        key, value = key_layer, value_layer
-
-        if original_window_size[0] == -1:
-            adjusted_left = -1
-        else:
-            adjusted_left = original_window_size[0] - step * chunk_len
-
-        adjusted_right = original_window_size[1] if step == 0 else -1
-        adjusted_window_size = (adjusted_left, adjusted_right)
-
-        if not causal or step <= comm.rank:
-            block_out, block_lse = call_block_attn(
-                query_layer,
-                key,
-                value,
-                softmax_scale,
-                causal and step == 0,
-                adjusted_window_size,
-                sinks=sinks,
-            )
-
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-
-        if step + 1 != comm.world_size:
-            comm.wait()
-            key_layer = next_k
-            value_layer = next_v
-
-    out = out.to(query.dtype)
-    output = out
-
-    return output
+    if window_size[0] == -1:
+        return _moreh_gpt_attention_balanced_full(
+            module,
+            query,
+            key,
+            value,
+            sinks,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            is_kernel_bhsd=is_kernel_bhsd,
+        )
+    else:
+        return _moreh_gpt_attention_balanced_window(
+            module,
+            query,
+            key,
+            value,
+            sinks,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            is_kernel_bhsd=is_kernel_bhsd,
+        )
 
 
 def _moreh_mla_ring_attention_balanced_full(
@@ -818,3 +768,137 @@ def _moreh_gpt_attention_balanced_full(
     output = out
 
     return output
+
+
+def _moreh_gpt_attention_balanced_window(
+    module,
+    query,
+    key,
+    value,
+    sinks=None,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert window_size[1] == -1, "Only left-side window size is supported in balanced ring attention."
+    assert causal is True, "Balanced Ring Attention requires causal=True."
+
+    comm0 = RingComm(module.ring_pg)
+    comm1 = RingComm(module.ring_pg)
+    comm1.send_rank, comm1.recv_rank = comm1.recv_rank, comm1.send_rank
+
+    global _WARMUPED
+
+    if not _WARMUPED:
+        for comm in [comm0, comm1]:
+            tensor = torch.empty_like(key)
+            received_tensor: torch.Tensor = comm.send_recv(tensor)
+            comm_stream = _get_ring_comm_stream()
+            with torch.cuda.stream(comm_stream):
+                comm.commit()
+            comm.wait()
+            received_tensor += 1.0
+        _WARMUPED = True
+
+    query_layer = query
+    key_layer = key
+    value_layer = value
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+
+    block_seq_len = query_layer.shape[1] // 2
+    query0 = query_layer[:, :block_seq_len]
+    query1 = query_layer[:, block_seq_len:]
+    key_layer0 = key_layer[:, :block_seq_len]
+    key_layer1 = key_layer[:, block_seq_len:]
+    value_layer0 = value_layer[:, :block_seq_len]
+    value_layer1 = value_layer[:, block_seq_len:]
+
+    out = None
+    lse = None
+
+    original_window_size = window_size
+    chunk_len_zigzag = query_layer.shape[1] // 2
+
+    for step in range(comm0.world_size):
+        if step + 1 != comm0.world_size:
+            next_k0: torch.Tensor = comm0.send_recv(key_layer0.contiguous())
+            next_k1: torch.Tensor = comm1.send_recv(key_layer1.contiguous())
+            next_v0: torch.Tensor = comm0.send_recv(value_layer0.contiguous())
+            next_v1: torch.Tensor = comm1.send_recv(value_layer1.contiguous())
+            comm0.commit()
+            comm1.commit()
+
+        if original_window_size[0] == -1:
+            adjusted_left = -1
+        else:
+            adjusted_left = original_window_size[0] - step * chunk_len_zigzag
+        adjusted_window_size = (adjusted_left, -1)
+
+        if step == 0:
+            if comm0.rank == comm0.world_size - 1:
+                # Last rank: its two zigzag halves are adjacent in global order,
+                # so full causal attention across the combined local chunk.
+                block_out, block_lse = call_block_attn(
+                    query_layer, key_layer, value_layer,
+                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
+                )
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            else:
+                block_out, block_lse = call_block_attn(
+                    query0, key_layer0, value_layer0,
+                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
+                )
+                out, lse = update_out_and_lse(
+                    out, lse, block_out, block_lse,
+                    slice_=(slice(None), slice(None, block_seq_len)),
+                )
+                block_out, block_lse = call_block_attn(
+                    query1, key_layer1, value_layer1,
+                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
+                )
+                out, lse = update_out_and_lse(
+                    out, lse, block_out, block_lse,
+                    slice_=(slice(None), slice(block_seq_len, None)),
+                )
+        else:
+            # comm0 shifts key0 backward (rank r receives from rank r-step):
+            # query0 (global block r) attends to key0 from global block r-step.
+            # Guard against wrap-around: only valid when r >= step.
+            if comm0.rank >= step:
+                block_out, block_lse = call_block_attn(
+                    query0, key_layer0, value_layer0,
+                    softmax_scale, False, adjusted_window_size, sinks=sinks,
+                )
+                out, lse = update_out_and_lse(
+                    out, lse, block_out, block_lse,
+                    slice_=(slice(None), slice(None, block_seq_len)),
+                )
+            # comm1 shifts key1 forward (rank r receives from rank r+step):
+            # query1 (global block 2N-1-r) attends to key1 from global block 2N-1-(r+step).
+            # Guard against wrap-around: only valid when r+step < world_size.
+            if comm0.rank + step < comm0.world_size:
+                block_out, block_lse = call_block_attn(
+                    query1, key_layer1, value_layer1,
+                    softmax_scale, False, adjusted_window_size, sinks=sinks,
+                )
+                out, lse = update_out_and_lse(
+                    out, lse, block_out, block_lse,
+                    slice_=(slice(None), slice(block_seq_len, None)),
+                )
+
+        if step + 1 != comm0.world_size:
+            comm0.wait()
+            comm1.wait()
+            key_layer0 = next_k0
+            key_layer1 = next_k1
+            value_layer0 = next_v0
+            value_layer1 = next_v1
+
+    out = out.to(query.dtype)
+    return out
