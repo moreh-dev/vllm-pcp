@@ -245,9 +245,9 @@ from vllm.resources.ring_attention import (
     AttnType,
     RingComm,
     SeqAllToAll4D,
-    moreh_gpt_attention,
-    _moreh_gpt_attention_balanced_full,
-    _moreh_mla_ring_attention_balanced_full,
+    gpt_ring_attention,
+    _gpt_ring_attention_full,
+    _mla_ring_attention_full,
 )
 
 
@@ -2039,25 +2039,20 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         if sp_size > 1:
             # Ring Attention / SP path
-            
+
             q_in = q
-            
-            # Sinks are dummy for now?
-            sinks = torch.zeros(self.num_heads, dtype=q.dtype, device=q.device)
-            sinks.fill_(float('-inf'))
 
             if use_compressed_ring:
                  q_in = q_in.unsqueeze(0)
                  kv_c_normed_in = kv_c_normed.unsqueeze(0)
                  k_pe_in = k_pe.unsqueeze(0)
-                 
+
                  # Call Compressed Ring Attention
-                 ring_out = _moreh_mla_ring_attention_balanced_full(
+                 ring_out = _mla_ring_attention_full(
                     self,
                     q_in,
                     kv_c_normed_in,
                     k_pe_in,
-                    sinks,
                     softmax_scale=self.scale,
                     causal=True,
                     window_size=(-1, -1),
@@ -2083,22 +2078,18 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     )
 
                     q_in, k_in, v_in = self._ulysses_qkv_all_to_all(q_in, k_in, maybe_padded_v_in, bounds_local, lengths_local)
-                    
-                    ulysses_rank = dist.get_rank(self.ulysses_pg)
-                    sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
-                
+
                 # Reshape to [B, S, H, D]. Assuming B=1 for this context.
                 q_in = q_in.unsqueeze(0)
                 k_in = k_in.unsqueeze(0)
                 v_in = v_in.unsqueeze(0)
 
-                # Call Ring Attention
-                ring_out = _moreh_gpt_attention_balanced_full(
+                # Call Ring Attention (MLA does not use sinks)
+                ring_out = _gpt_ring_attention_full(
                     self,
                     q_in,
                     k_in,
                     v_in,
-                    sinks,
                     softmax_scale=self.scale,
                     causal=True,
                     window_size=(-1, -1),

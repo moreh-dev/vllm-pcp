@@ -16,10 +16,14 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     get_pp_group,
+    get_rp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_up_group,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
+from vllm.resources.ring_attention import gpt_ring_attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -128,6 +132,19 @@ class OAIAttention(nn.Module):
             sinks=self.sinks,
         )
 
+        # Ring parallel setup — populated when ring/ulysses groups are initialized,
+        # otherwise None (no ring attention).
+        try:
+            self.ring_pg = get_rp_group().device_group
+        except AssertionError:
+            self.ring_pg = None
+        try:
+            self.ulysses_pg = get_up_group().device_group
+        except AssertionError:
+            self.ulysses_pg = None
+        self.use_pack_qkv = False  # required by gpt_ring_attention
+        self._ring_sliding_window = sliding_window  # window size for ring attn
+
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
@@ -135,9 +152,64 @@ class OAIAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         v = v.contiguous()
-        attn_output = self.attn(q, k, v)
+
+        if self.ring_pg is not None and dist.get_world_size(self.ring_pg) > 1:
+            attn_output = self._forward_ring_attention(q, k, v)
+        else:
+            attn_output = self.attn(q, k, v)
+
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _forward_ring_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        fwd_ctx = get_forward_context()
+        attn_metadata = fwd_ctx.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.attn.layer_name]
+        assert attn_metadata.num_decode_tokens == 0, (
+            "Ring attention is only supported for prefill, not decode"
+        )
+
+        num_tokens = q.shape[0]
+        # Reshape: [S, NH*HD] -> [S, NH, HD]
+        q_3d = q.view(num_tokens, self.num_local_attention_heads, self.head_dim)
+        k_3d = k.view(num_tokens, self.num_local_key_value_heads, self.head_dim)
+        v_3d = v.view(num_tokens, self.num_local_key_value_heads, self.head_dim)
+
+        # Slice sinks per ulysses rank if ulysses parallelism is used
+        sinks = self.sinks
+        if self.ulysses_pg is not None:
+            ulysses_size = dist.get_world_size(self.ulysses_pg)
+            if ulysses_size > 1:
+                ulysses_rank = dist.get_rank(self.ulysses_pg)
+                sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+
+        # Determine window size for ring attention
+        if self._ring_sliding_window is not None:
+            window_size = (self._ring_sliding_window, -1)
+        else:
+            window_size = (-1, -1)
+
+        # Ring attention expects [B, S, NH, HD]
+        q_4d = q_3d.unsqueeze(0)
+        k_4d = k_3d.unsqueeze(0)
+        v_4d = v_3d.unsqueeze(0)
+
+        ring_out = gpt_ring_attention(
+            self,
+            q_4d,
+            k_4d,
+            v_4d,
+            sinks=sinks,
+            softmax_scale=self.scaling,
+            causal=True,
+            window_size=window_size,
+        )
+
+        # [1, S, NH, HD] -> [S, NH*HD]
+        return ring_out.view(num_tokens, self.q_size)
 
 
 class MLPBlock(torch.nn.Module):
