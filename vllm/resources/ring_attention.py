@@ -851,81 +851,114 @@ def _gpt_ring_attention_windowed(
     original_window_size = window_size
     chunk_len_zigzag = query_layer.shape[1] // 2
 
-    for step in range(comm0.world_size):
-        if step + 1 != comm0.world_size:
-            next_k0: torch.Tensor = comm0.send_recv(key_layer0.contiguous())
-            next_k1: torch.Tensor = comm1.send_recv(key_layer1.contiguous())
-            next_v0: torch.Tensor = comm0.send_recv(value_layer0.contiguous())
-            next_v1: torch.Tensor = comm1.send_recv(value_layer1.contiguous())
+    q0_global_start = rank * block_seq_len
+    q1_global_start = (2 * world_size - 1 - rank) * block_seq_len
+
+    for step in range(world_size):
+        if step + 1 != world_size:
+            next_k0 = comm0.send_recv(key_layer0.contiguous())
+            next_k1 = comm1.send_recv(key_layer1.contiguous())
+            next_v0 = comm0.send_recv(value_layer0.contiguous())
+            next_v1 = comm1.send_recv(value_layer1.contiguous())
             comm0.commit()
             comm1.commit()
 
-        if original_window_size[0] == -1:
-            adjusted_left = -1
-        else:
-            adjusted_left = original_window_size[0] - step * chunk_len_zigzag
-        adjusted_window_size = (adjusted_left, -1)
+        # Key global positions at this step
+        k0_block = (rank - step) % world_size
+        k1_block = 2 * world_size - 1 - ((rank + step) % world_size)
+        k0_global_start = k0_block * block_seq_len
+        k1_global_start = k1_block * block_seq_len
 
         if step == 0:
-            if comm0.rank == comm0.world_size - 1:
-                # Last rank: its two zigzag halves are adjacent in global order,
-                # so full causal attention across the combined local chunk.
+            if rank == world_size - 1:
+                # Last rank: adjacent zigzag halves → full causal, full window
                 block_out, block_lse = call_block_attn(
                     query_layer, key_layer, value_layer,
-                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
-                )
+                    softmax_scale, causal, original_window_size, sinks=sinks)
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
             else:
-                block_out, block_lse = call_block_attn(
-                    query0, key_layer0, value_layer0,
-                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
-                )
-                out, lse = update_out_and_lse(
-                    out, lse, block_out, block_lse,
+                # q0 x k0 (causal, same block)
+                out, lse = _compute_pair_attn(
+                    query0, key_layer0, value_layer0, out, lse,
+                    q0_global_start, k0_global_start, block_seq_len,
+                    original_window_size, softmax_scale, causal, sinks,
                     slice_=(slice(None), slice(None, block_seq_len)),
+                    call_block_attn=call_block_attn,
+                    update_out_and_lse=update_out_and_lse,
                 )
-                block_out, block_lse = call_block_attn(
-                    query1, key_layer1, value_layer1,
-                    softmax_scale, causal, adjusted_window_size, sinks=sinks,
-                )
-                out, lse = update_out_and_lse(
-                    out, lse, block_out, block_lse,
+                # q1 x k1 (causal, same block)
+                out, lse = _compute_pair_attn(
+                    query1, key_layer1, value_layer1, out, lse,
+                    q1_global_start, k1_global_start, block_seq_len,
+                    original_window_size, softmax_scale, causal, sinks,
                     slice_=(slice(None), slice(block_seq_len, None)),
+                    call_block_attn=call_block_attn,
+                    update_out_and_lse=update_out_and_lse,
+                )
+                # q1 x k0 (cross-pair)
+                out, lse = _compute_pair_attn(
+                    query1, key_layer0, value_layer0, out, lse,
+                    q1_global_start, k0_global_start, block_seq_len,
+                    original_window_size, softmax_scale, causal, sinks,
+                    slice_=(slice(None), slice(block_seq_len, None)),
+                    call_block_attn=call_block_attn,
+                    update_out_and_lse=update_out_and_lse,
+                )
+                # q0 x k1 (cross-pair, mostly masked)
+                out, lse = _compute_pair_attn(
+                    query0, key_layer1, value_layer1, out, lse,
+                    q0_global_start, k1_global_start, block_seq_len,
+                    original_window_size, softmax_scale, causal, sinks,
+                    slice_=(slice(None), slice(None, block_seq_len)),
+                    call_block_attn=call_block_attn,
+                    update_out_and_lse=update_out_and_lse,
                 )
         else:
-            # comm0 shifts key0 backward (rank r receives from rank r-step):
-            # query0 (global block r) attends to key0 from global block r-step.
-            # Guard against wrap-around: only valid when r >= step.
-            if comm0.rank >= step:
-                block_out, block_lse = call_block_attn(
-                    query0, key_layer0, value_layer0,
-                    softmax_scale, False, adjusted_window_size, sinks=sinks,
-                )
-                out, lse = update_out_and_lse(
-                    out, lse, block_out, block_lse,
-                    slice_=(slice(None), slice(None, block_seq_len)),
-                )
-            # comm1 shifts key1 forward (rank r receives from rank r+step):
-            # query1 (global block 2N-1-r) attends to key1 from global block 2N-1-(r+step).
-            # Guard against wrap-around: only valid when r+step < world_size.
-            if comm0.rank + step < comm0.world_size:
-                block_out, block_lse = call_block_attn(
-                    query1, key_layer1, value_layer1,
-                    softmax_scale, False, adjusted_window_size, sinks=sinks,
-                )
-                out, lse = update_out_and_lse(
-                    out, lse, block_out, block_lse,
-                    slice_=(slice(None), slice(block_seq_len, None)),
-                )
+            # q0 x k0
+            out, lse = _compute_pair_attn(
+                query0, key_layer0, value_layer0, out, lse,
+                q0_global_start, k0_global_start, block_seq_len,
+                original_window_size, softmax_scale, False, sinks,
+                slice_=(slice(None), slice(None, block_seq_len)),
+                call_block_attn=call_block_attn,
+                update_out_and_lse=update_out_and_lse,
+            )
+            # q1 x k1
+            out, lse = _compute_pair_attn(
+                query1, key_layer1, value_layer1, out, lse,
+                q1_global_start, k1_global_start, block_seq_len,
+                original_window_size, softmax_scale, False, sinks,
+                slice_=(slice(None), slice(block_seq_len, None)),
+                call_block_attn=call_block_attn,
+                update_out_and_lse=update_out_and_lse,
+            )
+            # q1 x k0
+            out, lse = _compute_pair_attn(
+                query1, key_layer0, value_layer0, out, lse,
+                q1_global_start, k0_global_start, block_seq_len,
+                original_window_size, softmax_scale, False, sinks,
+                slice_=(slice(None), slice(block_seq_len, None)),
+                call_block_attn=call_block_attn,
+                update_out_and_lse=update_out_and_lse,
+            )
+            # q0 x k1
+            out, lse = _compute_pair_attn(
+                query0, key_layer1, value_layer1, out, lse,
+                q0_global_start, k1_global_start, block_seq_len,
+                original_window_size, softmax_scale, False, sinks,
+                slice_=(slice(None), slice(None, block_seq_len)),
+                call_block_attn=call_block_attn,
+                update_out_and_lse=update_out_and_lse,
+            )
 
-        if step + 1 != comm0.world_size:
+        if step + 1 != world_size:
             comm0.wait()
             comm1.wait()
             key_layer0 = next_k0
             key_layer1 = next_k1
             value_layer0 = next_v0
             value_layer1 = next_v1
-
+            
     out = out.to(query.dtype)
     if ulysses_size > 1:
         return SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
